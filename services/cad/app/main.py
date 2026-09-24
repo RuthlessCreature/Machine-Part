@@ -100,6 +100,13 @@ async def draw(project_id: str, request: Request) -> dict:
     body = await request.json()
     part_ids = body.get("part_ids") or []
     revision = int(body.get("revision") or 0)
+    drawing_plan = body.get("drawing_plan") or {}
+    plan_parts = drawing_plan.get("parts") if isinstance(drawing_plan, dict) else []
+    directives = {
+        str(item.get("part_id")): item
+        for item in (plan_parts or [])
+        if isinstance(item, dict) and item.get("part_id")
+    }
     if not isinstance(part_ids, list) or not part_ids:
         raise HTTPException(400, "part_ids must be a non-empty array")
     if len(part_ids) > 500:
@@ -120,6 +127,7 @@ async def draw(project_id: str, request: Request) -> dict:
                 part_id,
                 WORK_ROOT / project_id / "artifacts" / "drawings" / part_id / f"r{revision}",
                 revision,
+                directives.get(part_id),
             )
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
