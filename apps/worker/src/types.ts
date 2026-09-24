@@ -5,6 +5,7 @@ export type ProjectStatus =
   | "uploaded"
   | "ingesting"
   | "assembly_selection_required"
+  | "converter_required"
   | "stage1_ready"
   | "stage2_generating"
   | "stage2_draft_ready"
