@@ -46,8 +46,12 @@
     "cpu_ms": 300000,
     "subrequests": 10000
   },
+  "routes": [
+    { "pattern": "ikun.homes", "custom_domain": true }
+  ],
+  "observability": { "enabled": true },
   "vars": {
-    "MINIMAX_BASE_URL": "https://api.minimax.io/v1",
+    "MINIMAX_CHAT_URL": "https://api.minimax.io/v1/text/chatcompletion_v2",
     "MINIMAX_CHAT_PATH": "/text/chatcompletion_v2",
     "MINIMAX_MODEL": "MiniMax-M3"
   }
