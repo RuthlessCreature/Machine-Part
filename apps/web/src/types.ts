@@ -64,3 +64,18 @@ export interface CostingResult {
   lines: CostingLine[];
   policy: Record<string, unknown>;
 }
+
+export interface AssemblyCandidate {
+  path: string;
+  format: string;
+  direct: boolean;
+  requires_converter: boolean;
+}
+
+export interface AssemblyCandidateResponse {
+  status: "assembly_selection_required" | "converter_required";
+  candidates?: AssemblyCandidate[];
+  candidate?: AssemblyCandidate;
+  note?: string;
+  format?: string;
+}
