@@ -20,7 +20,9 @@ function contentType(format: string): string {
     json: "application/json",
     svg: "image/svg+xml",
     pdf: "application/pdf",
-    dxf: "application/dxf"
+    dxf: "application/dxf",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    csv: "text/csv; charset=utf-8"
   } as Record<string, string>)[format] || "application/octet-stream";
 }
 
@@ -199,11 +201,73 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         };
       }
 
+      await step.do("mark-stage3-generating", () => patchStatus(this.env, projectId, "stage3_generating", 2));
+
+      const costPolicy = await step.do("stage3-ai-policy", async () => {
+        return minimaxJson<any>(this.env, {
+          system: [
+            "Return JSON only. Extract costing overrides from the user's instruction.",
+            "Never invent market prices, material prices, machine rates, quantities, or margins.",
+            "Use null for values the user did not state. Percentages must be decimal fractions, e.g. 25% => 0.25.",
+            "Material density may be null; the deterministic costing engine has a small verified material-density catalog.",
+            "Schema: {currency, material:{name,density_g_cm3,price_per_kg}, process:{stock_factor,machine_rate_per_hour,setup_minutes,removal_rate_cm3_min,inspection_minutes,tooling_pct,scrap_pct}, commercial:{gross_margin_pct}, assumptions:[]}"
+          ].join(" "),
+          user: instruction ?? ""
+        });
+      });
+
+      const costResult = await step.do("stage3-costing", async () => {
+        const container = getContainer(this.env.CAD_CONTAINER, projectId);
+        const response = await container.fetch(new Request(`http://cad/v1/jobs/${projectId}/cost`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            part_ids: selection.chosen.map((part: any) => part.id),
+            revision,
+            policy: costPolicy
+          })
+        }));
+        const body = await response.text();
+        if (!response.ok) throw new Error(`Costing generation ${response.status}: ${body}`);
+        return JSON.parse(body);
+      });
+
+      const stage3Keys: Record<string, string> = {};
+      await step.do("persist-stage3-artifacts", async () => {
+        const container = getContainer(this.env.CAD_CONTAINER, projectId);
+        await Promise.all(Object.entries(costResult.artifacts ?? {}).map(async ([format, relative]) => {
+          const response = await container.fetch(artifactUrl(projectId, String(relative)));
+          if (!response.ok || !response.body) {
+            throw new Error(`Stage 3 artifact fetch failed: ${relative} (${response.status})`);
+          }
+          const filename = format === "json" ? "costing.json"
+            : format === "xlsx" ? "bom.xlsx"
+            : format === "csv" ? "bom.csv"
+            : "quotation.pdf";
+          const key = `projects/${projectId}/stage3/r${revision}/${filename}`;
+          await this.env.BUCKET.put(key, response.body, {
+            httpMetadata: { contentType: contentType(format) }
+          });
+          stage3Keys[format] = key;
+        }));
+      });
+
+      await step.do("commit-stage3", async () => {
+        await this.env.DB.prepare(
+          "UPDATE projects SET status='stage3_ready', current_stage=3, costing_key=?, bom_key=?, quotation_key=?, updated_at=datetime('now') WHERE id=?"
+        ).bind(stage3Keys.json ?? null, stage3Keys.xlsx ?? null, stage3Keys.pdf ?? null, projectId).run();
+      });
+
       return {
-        status: "stage2_draft_ready",
+        status: "stage3_ready",
         stage1: { manifestKey, glbKey },
         stage2: { revision, planKey, drawingIndexKey, count: persistedIndex.count },
-        blockedAt: "stage3-costing-engine"
+        stage3: {
+          quoteComplete: Boolean(costResult.quote_complete),
+          currency: costResult.currency,
+          summary: costResult.summary,
+          artifacts: stage3Keys
+        }
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
