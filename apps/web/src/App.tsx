@@ -17,7 +17,6 @@ export default function App() {
   const [targetStage, setTargetStage] = useState<1 | 2 | 3>(1);
 
   const parts = useMemo(() => manifest?.nodes.filter(n => n.kind === "part") ?? [], [manifest]);
-  const selectedNames = useMemo(() => new Set(parts.filter(p => selected.has(p.id)).map(p => p.name)), [parts, selected]);
 
   async function poll(id: string) {
     for (let i = 0; i < 180; i++) {
@@ -64,9 +63,8 @@ export default function App() {
     });
   }
 
-  function pickByName(name: string) {
-    const part = parts.find(p => p.name === name);
-    if (part) toggle(part.id);
+  function pickById(id: string) {
+    if (parts.some(p => p.id === id)) toggle(id);
   }
 
   return (
@@ -107,7 +105,7 @@ export default function App() {
         </aside>
 
         <section className="center-panel">
-          {project && manifest ? <AssemblyViewer url={glbUrl(project.id)} selectedNames={selectedNames} onPick={pickByName} /> :
+          {project && manifest ? <AssemblyViewer url={glbUrl(project.id)} selectedIds={selected} onPick={pickById} /> :
             <div className="empty-view"><div className="wirecube"/><h1>装配体视窗</h1><p>上传真实 CAD 后，OCCT 在 Cloudflare Container 内解析并输出 GLB。</p></div>}
         </section>
 
