@@ -85,17 +85,29 @@ export default {
       if (!p) return json({ error: "project not found" }, 404);
       const body = await request.json<any>().catch(() => ({}));
       const targetStage = Math.max(1, Math.min(3, Number(body.targetStage || 1))) as 1 | 2 | 3;
-      const instance = await env.CAD_PIPELINE.create({
-        id: `${id}-${Date.now()}`,
-        params: {
-          projectId: id,
-          targetStage,
-          selectedPartIds: Array.isArray(body.selectedPartIds) ? body.selectedPartIds : undefined,
-          instruction: typeof body.instruction === "string" ? body.instruction : undefined,
-          assemblyCandidate: typeof body.assemblyCandidate === "string" ? body.assemblyCandidate : undefined
-        }
-      });
-      return json({ workflowId: instance.id, targetStage }, 202);
+      const queuedStage = Math.max(0, targetStage - 1);
+      await env.DB.prepare(
+        "UPDATE projects SET status='ingesting', current_stage=MIN(current_stage, ?), last_error=NULL, updated_at=datetime('now') WHERE id=?"
+      ).bind(queuedStage, id).run();
+      try {
+        const instance = await env.CAD_PIPELINE.create({
+          id: `${id}-${Date.now()}`,
+          params: {
+            projectId: id,
+            targetStage,
+            selectedPartIds: Array.isArray(body.selectedPartIds) ? body.selectedPartIds : undefined,
+            instruction: typeof body.instruction === "string" ? body.instruction : undefined,
+            assemblyCandidate: typeof body.assemblyCandidate === "string" ? body.assemblyCandidate : undefined
+          }
+        });
+        return json({ workflowId: instance.id, targetStage }, 202);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await env.DB.prepare(
+          "UPDATE projects SET status='failed', last_error=?, updated_at=datetime('now') WHERE id=?"
+        ).bind(message, id).run();
+        return json({ error: message }, 500);
+      }
     }
 
     id = idFrom(pathname, "/assembly-candidates");
@@ -215,17 +227,28 @@ export default {
         feedback,
         createdAt: new Date().toISOString()
       }), { httpMetadata: { contentType: "application/json" } });
-      const instance = await env.CAD_PIPELINE.create({
-        id: `${id}-revision-${revision}-${Date.now()}`,
-        params: {
-          projectId: id,
-          targetStage: 2,
-          selectedPartIds: [partId],
-          instruction: `Reviewer feedback for drawing revision ${revision}: ${feedback}`,
-          revision
-        }
-      });
-      return json({ workflowId: instance.id, revision, reviewKey }, 202);
+      await env.DB.prepare(
+        "UPDATE projects SET status='ingesting', current_stage=1, last_error=NULL, updated_at=datetime('now') WHERE id=?"
+      ).bind(id).run();
+      try {
+        const instance = await env.CAD_PIPELINE.create({
+          id: `${id}-revision-${revision}-${Date.now()}`,
+          params: {
+            projectId: id,
+            targetStage: 2,
+            selectedPartIds: [partId],
+            instruction: `Reviewer feedback for drawing revision ${revision}: ${feedback}`,
+            revision
+          }
+        });
+        return json({ workflowId: instance.id, revision, reviewKey }, 202);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await env.DB.prepare(
+          "UPDATE projects SET status='failed', last_error=?, updated_at=datetime('now') WHERE id=?"
+        ).bind(message, id).run();
+        return json({ error: message }, 500);
+      }
     }
 
     if (pathname.startsWith("/api/")) return json({ error: "not found" }, 404);
