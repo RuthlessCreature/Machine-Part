@@ -39,3 +39,28 @@ export interface DrawingIndex {
   drawings: DrawingRecord[];
   release_status: string;
 }
+
+export interface CostingLine {
+  part_id: string;
+  part_name: string;
+  quantity: number;
+  material: string;
+  mass_kg: number;
+  material_cost: number;
+  cycle_minutes: number;
+  machine_cost: number;
+  unit_cost: number;
+  unit_quote: number;
+  extended_quote: number;
+  confidence: string;
+}
+
+export interface CostingResult {
+  project_id: string;
+  currency: string;
+  quote_complete: boolean;
+  release_status: string;
+  totals: { estimated_cost: number; quoted_price: number };
+  lines: CostingLine[];
+  policy: Record<string, unknown>;
+}
