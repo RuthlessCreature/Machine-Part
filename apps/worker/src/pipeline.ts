@@ -33,7 +33,7 @@ function artifactUrl(projectId: string, relativePath: string): string {
 
 export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams> {
   async run(event: WorkflowEvent<PipelineParams>, step: WorkflowStep) {
-    const { projectId, targetStage, selectedPartIds, instruction } = event.payload;
+    const { projectId, targetStage, selectedPartIds, instruction, assemblyCandidate } = event.payload;
     const requestedRevision = Math.max(0, Number(event.payload.revision ?? 0));
 
     try {
@@ -50,7 +50,10 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         const container = getContainer(this.env.CAD_CONTAINER, projectId);
         const response = await container.fetch(new Request(`http://cad/v1/jobs/${projectId}/ingest`, {
           method: "POST",
-          headers: { "x-filename": p.source_name! },
+          headers: {
+            "x-filename": p.source_name!,
+            ...(assemblyCandidate ? { "x-assembly-candidate": assemblyCandidate } : {})
+          },
           body: source.body
         }));
         const text = await response.text();
