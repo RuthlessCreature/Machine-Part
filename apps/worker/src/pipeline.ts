@@ -147,7 +147,15 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
       const drawingIndexKey = `projects/${projectId}/stage2/r${revision}/drawing-index.json`;
       const persistedIndex = await step.do("persist-stage2-artifacts", async () => {
         const container = getContainer(this.env.CAD_CONTAINER, projectId);
-        const normalized = { ...drawingIndex, drawings: [] as any[] };
+        const inherited: any[] = [];
+        if (revision > 0 && p.drawing_index_key) {
+          const previous = await this.env.BUCKET.get(p.drawing_index_key);
+          if (previous) {
+            const previousIndex = JSON.parse(await previous.text());
+            inherited.push(...(previousIndex.drawings ?? []));
+          }
+        }
+        const byPart = new Map<string, any>(inherited.map((item: any) => [item.part_id, item]));
 
         for (const drawing of drawingIndex.drawings ?? []) {
           const savedArtifacts: Record<string, string> = {};
@@ -162,9 +170,15 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
             });
             savedArtifacts[format] = key;
           }));
-          normalized.drawings.push({ ...drawing, artifacts: savedArtifacts });
+          byPart.set(drawing.part_id, { ...drawing, revision, artifacts: savedArtifacts });
         }
 
+        const normalized = {
+          ...drawingIndex,
+          revision,
+          count: byPart.size,
+          drawings: Array.from(byPart.values())
+        };
         await this.env.BUCKET.put(drawingIndexKey, JSON.stringify(normalized), {
           httpMetadata: { contentType: "application/json" }
         });
