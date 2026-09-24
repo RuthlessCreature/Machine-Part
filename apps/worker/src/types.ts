@@ -42,6 +42,7 @@ export interface ProjectRow {
   current_revision: number;
   source_key: string | null;
   source_name: string | null;
+  assembly_candidate: string | null;
   manifest_key: string | null;
   glb_key: string | null;
   drawing_plan_key: string | null;
