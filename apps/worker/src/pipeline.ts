@@ -48,14 +48,20 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         const source = await this.env.BUCKET.get(p.source_key!);
         if (!source?.body) throw new Error("Source object missing from R2");
         const container = getContainer(this.env.CAD_CONTAINER, projectId);
-        const response = await container.fetch(new Request(`http://cad/v1/jobs/${projectId}/ingest`, {
+        const fixed = new FixedLengthStream(source.size);
+        const piping = source.body.pipeTo(fixed.writable);
+        const request = new Request(`http://cad/v1/jobs/${projectId}/ingest`, {
           method: "POST",
           headers: {
             "x-filename": p.source_name!,
             ...(assemblyCandidate ? { "x-assembly-candidate": assemblyCandidate } : {})
           },
-          body: source.body
-        }));
+          body: fixed.readable
+        });
+        const [response] = await Promise.all([
+          container.fetch(request),
+          piping.then(() => null)
+        ]);
         const text = await response.text();
         if (!response.ok) throw new Error(`CAD ingest ${response.status}: ${text}`);
         return JSON.parse(text);
