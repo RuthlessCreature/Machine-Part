@@ -28,6 +28,7 @@ export interface Env {
   ASSETS: Fetcher;
   MINIMAX_API_KEY: string;
   MINIMAX_BASE_URL: string;
+  MINIMAX_CHAT_PATH: string;
   MINIMAX_MODEL: string;
 }
 
