@@ -37,6 +37,30 @@ function artifactUrl(projectId: string, relativePath: string): string {
   return `http://cad/v1/jobs/${projectId}/artifacts/${safe}`;
 }
 
+async function putContainerResponse(
+  env: Env,
+  key: string,
+  response: Response,
+  fallbackContentType: string
+) {
+  if (!response.ok || !response.body) {
+    throw new Error(`Container artifact fetch failed: ${key} (${response.status})`);
+  }
+  const length = Number(response.headers.get("content-length"));
+  if (!Number.isFinite(length) || length < 0) {
+    throw new Error(`Container artifact has no valid Content-Length: ${key}`);
+  }
+
+  const fixed = new FixedLengthStream(length);
+  const piping = response.body.pipeTo(fixed.writable);
+  const storing = env.BUCKET.put(key, fixed.readable, {
+    httpMetadata: {
+      contentType: response.headers.get("content-type") || fallbackContentType
+    }
+  });
+  await Promise.all([storing, piping]);
+}
+
 async function loadCadSource(
   env: Env,
   p: ProjectRow,
@@ -141,12 +165,18 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         }
 
         await Promise.all([
-          this.env.BUCKET.put(manifestKey, manifestResponse.body, {
-            httpMetadata: { contentType: "application/json" }
-          }),
-          this.env.BUCKET.put(glbKey, glbResponse.body, {
-            httpMetadata: { contentType: "model/gltf-binary" }
-          })
+          putContainerResponse(
+            this.env,
+            manifestKey,
+            manifestResponse,
+            "application/json"
+          ),
+          putContainerResponse(
+            this.env,
+            glbKey,
+            glbResponse,
+            "model/gltf-binary"
+          )
         ]);
 
         return { status: "ready", summary: ingest.summary ?? null };
@@ -294,9 +324,12 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
                 }
                 const key =
                   `projects/${projectId}/stage2/${drawing.part_id}/r${revision}/drawing.${format}`;
-                await this.env.BUCKET.put(key, artifact.body, {
-                  httpMetadata: { contentType: contentType(format) }
-                });
+                await putContainerResponse(
+                  this.env,
+                  key,
+                  artifact,
+                  contentType(format)
+                );
                 savedArtifacts[format] = key;
               })
             );
@@ -400,9 +433,12 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
               : format === "csv" ? "bom.csv"
               : "quotation.pdf";
             const key = `projects/${projectId}/stage3/r${revision}/${filename}`;
-            await this.env.BUCKET.put(key, artifact.body, {
-              httpMetadata: { contentType: contentType(format) }
-            });
+            await putContainerResponse(
+              this.env,
+              key,
+              artifact,
+              contentType(format)
+            );
             artifactKeys[format] = key;
           })
         );
