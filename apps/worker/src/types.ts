@@ -18,6 +18,7 @@ export interface PipelineParams {
   selectedPartIds?: string[];
   instruction?: string;
   revision?: number;
+  assemblyCandidate?: string;
 }
 
 export interface Env {
