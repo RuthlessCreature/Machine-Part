@@ -1,17 +1,21 @@
 import { useMemo, useState } from "react";
 import { AssemblyViewer } from "./components/AssemblyViewer";
 import {
+  bomCsvUrl,
+  bomXlsxUrl,
   createProject,
   drawingUrl,
+  getCosting,
   getDrawings,
   getManifest,
   getProject,
   glbUrl,
+  quotationPdfUrl,
   reviseDrawing,
   runPipeline,
   uploadSource
 } from "./lib/api";
-import type { DrawingIndex, Manifest, Project } from "./types";
+import type { CostingResult, DrawingIndex, Manifest, Project } from "./types";
 import "./styles.css";
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -21,9 +25,11 @@ export default function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [drawings, setDrawings] = useState<DrawingIndex | null>(null);
+  const [costing, setCosting] = useState<CostingResult | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [costSelected, setCostSelected] = useState<Set<string>>(new Set());
   const [activeDrawingId, setActiveDrawingId] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<"3d" | "drawing">("3d");
+  const [viewMode, setViewMode] = useState<"3d" | "drawing" | "costing">("3d");
   const [reviewFeedback, setReviewFeedback] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("等待上传 CAD 文件");
@@ -42,7 +48,9 @@ export default function App() {
       const index = await getDrawings(id);
       setDrawings(index);
       setActiveDrawingId(current => current && index.drawings.some(d => d.part_id === current) ? current : index.drawings[0]?.part_id ?? null);
+      setCostSelected(current => current.size ? current : new Set(index.drawings.map(d => d.part_id)));
     }
+    if (p.current_stage >= 3) setCosting(await getCosting(id));
   }
 
   async function poll(id: string, target: 1 | 2 | 3) {
@@ -71,8 +79,10 @@ export default function App() {
     if (!file) return;
     setBusy(true);
     setDrawings(null);
+    setCosting(null);
     setManifest(null);
     setSelected(new Set());
+    setCostSelected(new Set());
     try {
       setMessage("创建项目…");
       const p = await createProject(file.name.replace(/\.[^.]+$/, ""));
@@ -82,8 +92,16 @@ export default function App() {
       setMessage(`启动流水线到阶段 ${targetStage}…`);
       await runPipeline(p.id, targetStage, [], instruction);
       await poll(p.id, targetStage);
-      setMessage(targetStage === 1 ? "阶段 1 完成：请选择需要出图的 Part" : `已完成到阶段 ${targetStage}`);
-      if (targetStage >= 2) setViewMode("drawing");
+      if (targetStage === 1) {
+        setMessage("阶段 1 完成：请选择需要出图的 Part");
+        setViewMode("3d");
+      } else if (targetStage === 2) {
+        setMessage("阶段 2 草稿完成：请逐张审核");
+        setViewMode("drawing");
+      } else {
+        setMessage("一键到底完成：请审核图纸、核价假设与报价");
+        setViewMode("costing");
+      }
     } catch (e) {
       setMessage(e instanceof Error ? e.message : String(e));
     } finally {
@@ -100,6 +118,22 @@ export default function App() {
       await poll(project.id, 2);
       setViewMode("drawing");
       setMessage("阶段 2 草稿完成：请逐张审核，数值几何来自 CAD 内核");
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function advanceStage3() {
+    if (!project || !costSelected.size) return;
+    setBusy(true);
+    try {
+      setMessage(`正在核价 ${costSelected.size} 张图纸对应的 Part…`);
+      await runPipeline(project.id, 3, Array.from(costSelected), instruction);
+      await poll(project.id, 3);
+      setViewMode("costing");
+      setMessage("阶段 3 完成：报价仍需核对材料价格、机时参数和商业假设");
     } catch (e) {
       setMessage(e instanceof Error ? e.message : String(e));
     } finally {
@@ -126,6 +160,14 @@ export default function App() {
 
   function toggle(id: string) {
     setSelected(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  function toggleCost(id: string) {
+    setCostSelected(prev => {
       const next = new Set(prev);
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
@@ -163,7 +205,7 @@ export default function App() {
 
           <div className="field">
             <label>一键到底 / 微调提示词</label>
-            <textarea value={instruction} onChange={e => setInstruction(e.target.value)} placeholder="例如：材料默认 6061-T6；跳过标准件；报价币种 CNY；毛利率 25%。" />
+            <textarea value={instruction} onChange={e => setInstruction(e.target.value)} placeholder="例如：材料 6061-T6，材料价 30 CNY/kg；机时 120 CNY/h；毛利率 25%；跳过标准件。" />
           </div>
 
           <button className="primary" disabled={!file || busy} onClick={startNew}>{busy ? "运行中…" : "新建并运行"}</button>
@@ -172,11 +214,16 @@ export default function App() {
               为所选 {selected.size} 个 Part 生成图纸
             </button>
           )}
+          {project && project.current_stage >= 2 && (
+            <button className="secondary" disabled={!costSelected.size || busy} onClick={advanceStage3}>
+              核价所选 {costSelected.size} 张图纸
+            </button>
+          )}
 
           {manifest && <div className="metrics">
             <div><b>{manifest.counts.parts}</b><span>Parts</span></div>
-            <div><b>{manifest.counts.assemblies}</b><span>Assemblies</span></div>
-            <div><b>{selected.size}</b><span>Selected</span></div>
+            <div><b>{drawings?.count ?? 0}</b><span>Drawings</span></div>
+            <div><b>{costSelected.size}</b><span>To Cost</span></div>
           </div>}
         </aside>
 
@@ -185,6 +232,7 @@ export default function App() {
             <div className="view-switch">
               <button className={viewMode === "3d" ? "active" : ""} onClick={() => setViewMode("3d")}>3D 装配体</button>
               <button className={viewMode === "drawing" ? "active" : ""} disabled={!drawings} onClick={() => setViewMode("drawing")}>2D 工程图</button>
+              <button className={viewMode === "costing" ? "active" : ""} disabled={!costing} onClick={() => setViewMode("costing")}>核价 / 报价</button>
             </div>
           )}
 
@@ -215,13 +263,41 @@ export default function App() {
             </div>
           )}
 
+          {project && costing && viewMode === "costing" && (
+            <div className="costing-workbench">
+              <div className="cost-summary">
+                <div><span>Estimated cost</span><b>{costing.totals.estimated_cost.toFixed(2)} {costing.currency}</b></div>
+                <div><span>Quoted price</span><b>{costing.totals.quoted_price.toFixed(2)} {costing.currency}</b></div>
+                <div><span>Quote state</span><b>{costing.quote_complete ? "Complete inputs" : "Missing material price / inputs"}</b></div>
+              </div>
+              <div className="artifact-links costing-links">
+                <a href={bomXlsxUrl(project.id)} target="_blank" rel="noreferrer">BOM.xlsx</a>
+                <a href={bomCsvUrl(project.id)} target="_blank" rel="noreferrer">BOM.csv</a>
+                <a href={quotationPdfUrl(project.id)} target="_blank" rel="noreferrer">Quotation.pdf</a>
+              </div>
+              {!costing.quote_complete && <div className="warning-banner">当前报价不完整：材料价格或关键材料参数缺失。系统没有瞎猜市场价，请补充后重跑。</div>}
+              <div className="cost-table-wrap">
+                <table className="cost-table">
+                  <thead><tr><th>Part</th><th>Qty</th><th>Material</th><th>Mass kg</th><th>Cycle min</th><th>Unit cost</th><th>Unit quote</th><th>Extended</th></tr></thead>
+                  <tbody>
+                    {costing.lines.map(line => <tr key={line.part_id}>
+                      <td>{line.part_name}</td><td>{line.quantity}</td><td>{line.material}</td>
+                      <td>{line.mass_kg.toFixed(3)}</td><td>{line.cycle_minutes.toFixed(1)}</td>
+                      <td>{line.unit_cost.toFixed(2)}</td><td>{line.unit_quote.toFixed(2)}</td><td>{line.extended_quote.toFixed(2)}</td>
+                    </tr>)}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           {!manifest && (
             <div className="empty-view"><div className="wirecube"/><h1>装配体视窗</h1><p>上传真实 CAD 后，OCCT 在 Cloudflare Container 内解析并输出 GLB。</p></div>
           )}
         </section>
 
         <aside className="panel right-panel">
-          <h2>{viewMode === "drawing" ? "Drawings" : "Parts"}</h2>
+          <h2>{viewMode === "drawing" ? "Drawings" : viewMode === "costing" ? "Cost Lines" : "Parts"}</h2>
           <div className="parts-list">
             {viewMode === "3d" && parts.map(part => (
               <button key={part.id} className={selected.has(part.id) ? "part active" : "part"} onClick={() => toggle(part.id)}>
@@ -230,10 +306,16 @@ export default function App() {
               </button>
             ))}
             {viewMode === "drawing" && drawings?.drawings.map(drawing => (
-              <button key={drawing.part_id} className={activeDrawing?.part_id === drawing.part_id ? "part active" : "part"} onClick={() => setActiveDrawingId(drawing.part_id)}>
-                <span>{drawing.part_name}</span>
-                <small>r{drawing.revision} · {drawing.features.length} cylindrical features</small>
-              </button>
+              <div key={drawing.part_id} className={activeDrawing?.part_id === drawing.part_id ? "drawing-row active" : "drawing-row"}>
+                <button className="part" onClick={() => setActiveDrawingId(drawing.part_id)}>
+                  <span>{drawing.part_name}</span>
+                  <small>r{drawing.revision} · {drawing.features.length} cylindrical features</small>
+                </button>
+                <label className="cost-check"><input type="checkbox" checked={costSelected.has(drawing.part_id)} onChange={() => toggleCost(drawing.part_id)} />核价</label>
+              </div>
+            ))}
+            {viewMode === "costing" && costing?.lines.map(line => (
+              <div className="part static" key={line.part_id}><span>{line.part_name}</span><small>{line.extended_quote.toFixed(2)} {costing.currency}</small></div>
             ))}
             {viewMode === "3d" && !parts.length && <p className="muted">阶段 1 完成后显示零件树。</p>}
             {viewMode === "drawing" && !drawings?.drawings.length && <p className="muted">阶段 2 完成后显示图纸列表。</p>}
