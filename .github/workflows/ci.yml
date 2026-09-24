@@ -16,6 +16,17 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npm run build:web
       - run: npm --workspace apps/worker run typecheck
+      - name: Validate Wrangler production bundle
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const path = "wrangler.jsonc";
+          const cfg = JSON.parse(fs.readFileSync(path, "utf8"));
+          cfg.d1_databases[0].database_id = "00000000-0000-0000-0000-000000000000";
+          fs.writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
+          NODE
+          npx wrangler deploy --dry-run --config wrangler.jsonc --outdir /tmp/wrangler-dry
 
   cad:
     runs-on: ubuntu-latest
