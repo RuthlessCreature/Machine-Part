@@ -15,6 +15,7 @@ jobs:
           node-version: 22
       - run: npm install --no-audit --no-fund
       - run: npm run build:web
+      - run: npm --workspace apps/worker run typecheck
 
   cad:
     runs-on: ubuntu-latest
