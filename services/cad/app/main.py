@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import zipfile
 from pathlib import Path
@@ -8,8 +9,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from .cad_engine import ingest_step
+from .drawing_engine import generate_drawing_bundle
 
-app = FastAPI(title="Machine Part CAD Service", version="0.1.0")
+app = FastAPI(title="Machine Part CAD Service", version="0.2.0")
 WORK_ROOT = Path("/tmp/machine-part")
 SUPPORTED_STEP = {".step", ".stp"}
 NATIVE_SW = {".sldasm", ".sldprt"}
@@ -19,9 +21,31 @@ def safe_name(name: str) -> str:
     return Path(name).name.replace("..", "_")
 
 
+def source_path(project_id: str) -> Path:
+    job_dir = WORK_ROOT / project_id
+    source_meta = job_dir / "source.json"
+    if not source_meta.exists():
+        raise HTTPException(409, "Source is not loaded in this CAD container")
+    source_name = json.loads(source_meta.read_text(encoding="utf-8"))["filename"]
+    path = job_dir / source_name
+    if not path.exists():
+        raise HTTPException(409, "Source CAD file is missing")
+    return path
+
+
+def artifact_path(project_id: str, relative_path: str) -> Path:
+    root = (WORK_ROOT / project_id / "artifacts").resolve()
+    path = (root / relative_path).resolve()
+    if root != path and root not in path.parents:
+        raise HTTPException(400, "Invalid artifact path")
+    if not path.is_file():
+        raise HTTPException(404, "Artifact not found")
+    return path
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "service": "cad", "version": "0.1.0"}
+    return {"ok": True, "service": "cad", "version": "0.2.0"}
 
 
 @app.post("/v1/jobs/{project_id}/ingest")
@@ -35,6 +59,7 @@ async def ingest(project_id: str, request: Request, x_filename: str = Header(def
     with source.open("wb") as f:
         async for chunk in request.stream():
             f.write(chunk)
+    (job_dir / "source.json").write_text(json.dumps({"filename": filename}), encoding="utf-8")
 
     ext = source.suffix.lower()
     if ext in SUPPORTED_STEP:
@@ -69,20 +94,72 @@ async def ingest(project_id: str, request: Request, x_filename: str = Header(def
     raise HTTPException(415, f"Unsupported CAD format: {ext or 'unknown'}")
 
 
+@app.post("/v1/jobs/{project_id}/draw")
+async def draw(project_id: str, request: Request) -> dict:
+    body = await request.json()
+    part_ids = body.get("part_ids") or []
+    revision = int(body.get("revision") or 0)
+    if not isinstance(part_ids, list) or not part_ids:
+        raise HTTPException(400, "part_ids must be a non-empty array")
+    if len(part_ids) > 500:
+        raise HTTPException(400, "Too many parts in one draw request")
+
+    source = source_path(project_id)
+    if source.suffix.lower() not in SUPPORTED_STEP:
+        raise HTTPException(409, "Selected source must first be converted to STEP/STP")
+
+    index = []
+    for part_id in part_ids:
+        part_id = str(part_id)
+        try:
+            result = generate_drawing_bundle(
+                source,
+                project_id,
+                part_id,
+                WORK_ROOT / project_id / "artifacts" / "drawings" / part_id / f"r{revision}",
+                revision,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        prefix = f"drawings/{part_id}/r{revision}"
+        index.append({
+            **{k: v for k, v in result.items() if k != "artifacts"},
+            "artifacts": {
+                "json": f"{prefix}/drawing.json",
+                "svg": f"{prefix}/drawing.svg",
+                "pdf": f"{prefix}/drawing.pdf",
+                "dxf": f"{prefix}/drawing.dxf",
+            },
+        })
+
+    payload = {
+        "schema_version": 1,
+        "project_id": project_id,
+        "revision": revision,
+        "count": len(index),
+        "drawings": index,
+        "release_status": "draft_requires_human_review",
+    }
+    index_path = WORK_ROOT / project_id / "artifacts" / "drawings" / f"r{revision}-index.json"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
 @app.get("/v1/jobs/{project_id}/manifest")
 def get_manifest(project_id: str) -> FileResponse:
-    path = WORK_ROOT / project_id / "artifacts" / "manifest.json"
-    if not path.exists():
-        raise HTTPException(404, "Manifest not found")
-    return FileResponse(path, media_type="application/json")
+    return FileResponse(artifact_path(project_id, "manifest.json"), media_type="application/json")
 
 
-@app.get("/v1/jobs/{project_id}/artifacts/{artifact_name}")
-def get_artifact(project_id: str, artifact_name: str) -> FileResponse:
-    if artifact_name not in {"assembly.glb", "manifest.json"}:
-        raise HTTPException(404, "Unknown artifact")
-    path = WORK_ROOT / project_id / "artifacts" / artifact_name
-    if not path.exists():
-        raise HTTPException(404, "Artifact not found")
-    media = "model/gltf-binary" if artifact_name.endswith(".glb") else "application/json"
-    return FileResponse(path, media_type=media, filename=artifact_name)
+@app.get("/v1/jobs/{project_id}/artifacts/{relative_path:path}")
+def get_artifact(project_id: str, relative_path: str) -> FileResponse:
+    path = artifact_path(project_id, relative_path)
+    suffix = path.suffix.lower()
+    media = {
+        ".glb": "model/gltf-binary",
+        ".json": "application/json",
+        ".svg": "image/svg+xml",
+        ".pdf": "application/pdf",
+        ".dxf": "application/dxf",
+    }.get(suffix, "application/octet-stream")
+    return FileResponse(path, media_type=media, filename=path.name)
