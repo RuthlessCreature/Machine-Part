@@ -135,9 +135,12 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
             system: [
               "You are a manufacturing drawing planner. Return JSON only.",
               "Never invent numeric geometry. CAD-kernel values are ground truth.",
-              "Classify each supplied part as machined, fabricated/sheet, purchased/standard, or unknown.",
-              "Propose view strategy, datum intent, dimension intent, tolerances that require human confirmation, and manufacturing notes.",
-              "If the user supplied revision feedback, translate it into structured drawing edit intent.",
+              "For each supplied part return exactly one object in parts[].",
+              "Schema: {parts:[{part_id,classification,drawing:{primary_view,show_hidden_lines,show_overall_dimensions,show_feature_table,notes,unresolved_requests}}]}.",
+              "primary_view must be one of +X,-X,+Y,-Y,+Z,-Z.",
+              "Never invent numeric geometry, tolerances, thread callouts, material, or PMI. CAD-kernel values are ground truth.",
+              "If a reviewer asks for a change the renderer cannot safely infer from CAD, put that request in unresolved_requests instead of pretending it was applied.",
+              "Allowed automatic drawing edits are only primary view direction, hidden-line visibility, overall-dimension visibility, cylindrical-feature-table visibility, and plain notes.",
               "Use concise Chinese notes."
             ].join(" "),
             user: JSON.stringify({
@@ -160,7 +163,8 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
               part_ids: selection.chosen.map((part: any) => part.id),
-              revision
+              revision,
+              drawing_plan: plan
             })
           }));
           const body = await response.text();
