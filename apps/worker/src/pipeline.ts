@@ -34,13 +34,15 @@ function artifactUrl(projectId: string, relativePath: string): string {
 export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams> {
   async run(event: WorkflowEvent<PipelineParams>, step: WorkflowStep) {
     const { projectId, targetStage, selectedPartIds, instruction } = event.payload;
-    const revision = Math.max(0, Number(event.payload.revision ?? 0));
+    const requestedRevision = Math.max(0, Number(event.payload.revision ?? 0));
 
     try {
       const p = await step.do("load-project", () => project(this.env, projectId));
       if (!p.source_key || !p.source_name) throw new Error("Project has no uploaded source");
 
-      await step.do("mark-ingesting", () => patchStatus(this.env, projectId, "ingesting", 0));
+      // The CAD container filesystem is ephemeral, so every workflow invocation reloads
+      // the source into the same project-scoped container before geometry work.
+      await step.do("mark-ingesting", () => patchStatus(this.env, projectId, "ingesting", Math.min(p.current_stage, 1)));
 
       const ingest = await step.do("cad-ingest", async () => {
         const source = await this.env.BUCKET.get(p.source_key!);
@@ -88,13 +90,13 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
 
       await step.do("commit-stage1", async () => {
         await this.env.DB.prepare(
-          "UPDATE projects SET status='stage1_ready', current_stage=1, manifest_key=?, glb_key=?, updated_at=datetime('now') WHERE id=?"
+          "UPDATE projects SET status='stage1_ready', current_stage=MAX(current_stage,1), manifest_key=?, glb_key=?, updated_at=datetime('now') WHERE id=?"
         ).bind(manifestKey, glbKey, projectId).run();
       });
 
       if (targetStage === 1) return { status: "stage1_ready", manifestKey, glbKey };
 
-      const selection = await step.do("prepare-stage2-selection", async () => {
+      const selection = await step.do("prepare-part-selection", async () => {
         const manifestObject = await this.env.BUCKET.get(manifestKey);
         if (!manifestObject) throw new Error("Stage 1 manifest missing from R2");
         const manifest = JSON.parse(await manifestObject.text());
@@ -102,102 +104,123 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         const chosen = selectedPartIds?.length
           ? parts.filter((part: any) => selectedPartIds.includes(part.id))
           : parts;
-        if (!chosen.length) throw new Error("No valid parts selected for Stage 2");
+        if (!chosen.length) throw new Error("No valid parts selected");
         return { parts, chosen };
       });
 
-      await step.do("mark-stage2-generating", () => patchStatus(this.env, projectId, "stage2_generating", 1));
+      // Stage 3 started from an existing Stage 2 draft must NOT regenerate or shrink the
+      // drawing index. The selectedPartIds in that case are only the parts to cost.
+      const reuseExistingStage2 =
+        targetStage === 3 &&
+        p.current_stage >= 2 &&
+        Boolean(p.drawing_index_key);
 
-      const plan = await step.do("stage2-ai-plan", async () => {
-        return minimaxJson<any>(this.env, {
-          system: [
-            "You are a manufacturing drawing planner. Return JSON only.",
-            "Never invent numeric geometry. CAD-kernel values are ground truth.",
-            "Classify each supplied part as machined, fabricated/sheet, purchased/standard, or unknown.",
-            "Propose view strategy, datum intent, dimension intent, tolerances that require human confirmation, and manufacturing notes.",
-            "If the user supplied revision feedback, translate it into structured drawing edit intent.",
-            "Use concise Chinese notes."
-          ].join(" "),
-          user: JSON.stringify({
-            instruction: instruction ?? "",
-            revision,
-            parts: selection.chosen.slice(0, 500)
-          })
+      let revision = requestedRevision;
+      let planKey = p.drawing_plan_key ?? "";
+      let drawingIndexKey = p.drawing_index_key ?? "";
+      let persistedIndex: any = null;
+
+      if (reuseExistingStage2) {
+        revision = p.current_revision;
+        persistedIndex = await step.do("reuse-stage2-index", async () => {
+          const obj = await this.env.BUCKET.get(p.drawing_index_key!);
+          if (!obj) throw new Error("Existing Stage 2 drawing index is missing from R2");
+          return JSON.parse(await obj.text());
         });
-      });
+      } else {
+        await step.do("mark-stage2-generating", () => patchStatus(this.env, projectId, "stage2_generating", 1));
 
-      const planKey = `projects/${projectId}/stage2/r${revision}/drawing-plan.json`;
-      await step.do("save-stage2-plan", () => this.env.BUCKET.put(planKey, JSON.stringify(plan), {
-        httpMetadata: { contentType: "application/json" }
-      }));
+        const plan = await step.do("stage2-ai-plan", async () => {
+          return minimaxJson<any>(this.env, {
+            system: [
+              "You are a manufacturing drawing planner. Return JSON only.",
+              "Never invent numeric geometry. CAD-kernel values are ground truth.",
+              "Classify each supplied part as machined, fabricated/sheet, purchased/standard, or unknown.",
+              "Propose view strategy, datum intent, dimension intent, tolerances that require human confirmation, and manufacturing notes.",
+              "If the user supplied revision feedback, translate it into structured drawing edit intent.",
+              "Use concise Chinese notes."
+            ].join(" "),
+            user: JSON.stringify({
+              instruction: instruction ?? "",
+              revision,
+              parts: selection.chosen.slice(0, 500)
+            })
+          });
+        });
 
-      const drawingIndex = await step.do("generate-stage2-drawings", async () => {
-        const container = getContainer(this.env.CAD_CONTAINER, projectId);
-        const response = await container.fetch(new Request(`http://cad/v1/jobs/${projectId}/draw`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            part_ids: selection.chosen.map((part: any) => part.id),
-            revision
-          })
-        }));
-        const body = await response.text();
-        if (!response.ok) throw new Error(`Drawing generation ${response.status}: ${body}`);
-        return JSON.parse(body);
-      });
-
-      const drawingIndexKey = `projects/${projectId}/stage2/r${revision}/drawing-index.json`;
-      const persistedIndex = await step.do("persist-stage2-artifacts", async () => {
-        const container = getContainer(this.env.CAD_CONTAINER, projectId);
-        const inherited: any[] = [];
-        if (revision > 0 && p.drawing_index_key) {
-          const previous = await this.env.BUCKET.get(p.drawing_index_key);
-          if (previous) {
-            const previousIndex = JSON.parse(await previous.text());
-            inherited.push(...(previousIndex.drawings ?? []));
-          }
-        }
-        const byPart = new Map<string, any>(inherited.map((item: any) => [item.part_id, item]));
-
-        for (const drawing of drawingIndex.drawings ?? []) {
-          const savedArtifacts: Record<string, string> = {};
-          await Promise.all(Object.entries(drawing.artifacts ?? {}).map(async ([format, relative]) => {
-            const response = await container.fetch(artifactUrl(projectId, String(relative)));
-            if (!response.ok || !response.body) {
-              throw new Error(`Drawing artifact fetch failed: ${relative} (${response.status})`);
-            }
-            const key = `projects/${projectId}/stage2/${drawing.part_id}/r${revision}/drawing.${format}`;
-            await this.env.BUCKET.put(key, response.body, {
-              httpMetadata: { contentType: contentType(format) }
-            });
-            savedArtifacts[format] = key;
-          }));
-          byPart.set(drawing.part_id, { ...drawing, revision, artifacts: savedArtifacts });
-        }
-
-        const normalized = {
-          ...drawingIndex,
-          revision,
-          count: byPart.size,
-          drawings: Array.from(byPart.values())
-        };
-        await this.env.BUCKET.put(drawingIndexKey, JSON.stringify(normalized), {
+        planKey = `projects/${projectId}/stage2/r${revision}/drawing-plan.json`;
+        await step.do("save-stage2-plan", () => this.env.BUCKET.put(planKey, JSON.stringify(plan), {
           httpMetadata: { contentType: "application/json" }
-        });
-        return normalized;
-      });
+        }));
 
-      await step.do("commit-stage2", async () => {
-        await this.env.DB.prepare(
-          "UPDATE projects SET status='stage2_draft_ready', current_stage=2, current_revision=?, drawing_plan_key=?, drawing_index_key=?, updated_at=datetime('now') WHERE id=?"
-        ).bind(revision, planKey, drawingIndexKey, projectId).run();
-      });
+        const drawingIndex = await step.do("generate-stage2-drawings", async () => {
+          const container = getContainer(this.env.CAD_CONTAINER, projectId);
+          const response = await container.fetch(new Request(`http://cad/v1/jobs/${projectId}/draw`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              part_ids: selection.chosen.map((part: any) => part.id),
+              revision
+            })
+          }));
+          const body = await response.text();
+          if (!response.ok) throw new Error(`Drawing generation ${response.status}: ${body}`);
+          return JSON.parse(body);
+        });
+
+        drawingIndexKey = `projects/${projectId}/stage2/r${revision}/drawing-index.json`;
+        persistedIndex = await step.do("persist-stage2-artifacts", async () => {
+          const container = getContainer(this.env.CAD_CONTAINER, projectId);
+          const inherited: any[] = [];
+          if (revision > 0 && p.drawing_index_key) {
+            const previous = await this.env.BUCKET.get(p.drawing_index_key);
+            if (previous) {
+              const previousIndex = JSON.parse(await previous.text());
+              inherited.push(...(previousIndex.drawings ?? []));
+            }
+          }
+          const byPart = new Map<string, any>(inherited.map((item: any) => [item.part_id, item]));
+
+          for (const drawing of drawingIndex.drawings ?? []) {
+            const savedArtifacts: Record<string, string> = {};
+            await Promise.all(Object.entries(drawing.artifacts ?? {}).map(async ([format, relative]) => {
+              const response = await container.fetch(artifactUrl(projectId, String(relative)));
+              if (!response.ok || !response.body) {
+                throw new Error(`Drawing artifact fetch failed: ${relative} (${response.status})`);
+              }
+              const key = `projects/${projectId}/stage2/${drawing.part_id}/r${revision}/drawing.${format}`;
+              await this.env.BUCKET.put(key, response.body, {
+                httpMetadata: { contentType: contentType(format) }
+              });
+              savedArtifacts[format] = key;
+            }));
+            byPart.set(drawing.part_id, { ...drawing, revision, artifacts: savedArtifacts });
+          }
+
+          const normalized = {
+            ...drawingIndex,
+            revision,
+            count: byPart.size,
+            drawings: Array.from(byPart.values())
+          };
+          await this.env.BUCKET.put(drawingIndexKey, JSON.stringify(normalized), {
+            httpMetadata: { contentType: "application/json" }
+          });
+          return normalized;
+        });
+
+        await step.do("commit-stage2", async () => {
+          await this.env.DB.prepare(
+            "UPDATE projects SET status='stage2_draft_ready', current_stage=2, current_revision=?, drawing_plan_key=?, drawing_index_key=?, updated_at=datetime('now') WHERE id=?"
+          ).bind(revision, planKey, drawingIndexKey, projectId).run();
+        });
+      }
 
       if (targetStage === 2) {
         return {
           status: "stage2_draft_ready",
           stage1: { manifestKey, glbKey },
-          stage2: { revision, planKey, drawingIndexKey, count: persistedIndex.count }
+          stage2: { revision, planKey, drawingIndexKey, count: persistedIndex?.count ?? 0 }
         };
       }
 
@@ -261,7 +284,7 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
       return {
         status: "stage3_ready",
         stage1: { manifestKey, glbKey },
-        stage2: { revision, planKey, drawingIndexKey, count: persistedIndex.count },
+        stage2: { revision, planKey, drawingIndexKey, count: persistedIndex?.count ?? 0 },
         stage3: {
           quoteComplete: Boolean(costResult.quote_complete),
           currency: costResult.currency,
