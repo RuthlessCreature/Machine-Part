@@ -1,0 +1,18 @@
+{
+  "name": "@machine-part/worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy --config ../../wrangler.jsonc",
+    "dev": "wrangler dev --config ../../wrangler.jsonc",
+    "cf:typegen": "wrangler types --config ../../wrangler.jsonc worker-configuration.d.ts"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.135.0"
+  }
+}
