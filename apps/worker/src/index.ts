@@ -120,7 +120,9 @@ export default {
       const [, projectId, partId, format] = drawingMatch;
       const p = await getProject(env, projectId);
       if (!p) return json({ error: "project not found" }, 404);
-      const key = `projects/${projectId}/stage2/${partId}/r${p.current_revision}/drawing.${format}`;
+      const requested = Number(url.searchParams.get("revision"));
+      const revision = Number.isFinite(requested) && requested >= 0 ? requested : p.current_revision;
+      const key = `projects/${projectId}/stage2/${partId}/r${revision}/drawing.${format}`;
       return artifactResponse(env, key);
     }
 
