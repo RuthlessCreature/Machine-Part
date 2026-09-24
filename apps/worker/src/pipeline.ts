@@ -9,7 +9,13 @@ async function project(env: Env, id: string): Promise<ProjectRow> {
   return row;
 }
 
-async function patchStatus(env: Env, id: string, status: string, stage: number, error: string | null = null) {
+async function patchStatus(
+  env: Env,
+  id: string,
+  status: string,
+  stage: number,
+  error: string | null = null
+) {
   await env.DB.prepare(
     "UPDATE projects SET status=?, current_stage=?, last_error=?, updated_at=datetime('now') WHERE id=?"
   ).bind(status, stage, error, id).run();
@@ -31,6 +37,55 @@ function artifactUrl(projectId: string, relativePath: string): string {
   return `http://cad/v1/jobs/${projectId}/artifacts/${safe}`;
 }
 
+async function loadCadSource(
+  env: Env,
+  p: ProjectRow,
+  projectId: string,
+  assemblyCandidate?: string
+) {
+  if (!p.source_key || !p.source_name) throw new Error("Project has no uploaded source");
+  const source = await env.BUCKET.get(p.source_key);
+  if (!source?.body) throw new Error("Source object missing from R2");
+
+  const container = getContainer(env.CAD_CONTAINER, projectId);
+  const fixed = new FixedLengthStream(source.size);
+  const piping = source.body.pipeTo(fixed.writable);
+  const request = new Request(`http://cad/v1/jobs/${projectId}/ingest`, {
+    method: "POST",
+    headers: {
+      "x-filename": p.source_name,
+      ...(assemblyCandidate ? { "x-assembly-candidate": assemblyCandidate } : {})
+    },
+    body: fixed.readable
+  });
+
+  const [response] = await Promise.all([
+    container.fetch(request),
+    piping.then(() => null)
+  ]);
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`CAD ingest ${response.status}: ${raw}`);
+
+  let ingest: any;
+  try {
+    ingest = JSON.parse(raw);
+  } catch {
+    throw new Error(`CAD ingest returned invalid JSON: ${raw.slice(0, 1000)}`);
+  }
+  return { container, ingest };
+}
+
+function assertCadReady(ingest: any, context: string): void {
+  if (ingest?.status === "ready") return;
+  if (ingest?.status === "converter_required") {
+    throw new Error(`${context}: native CAD converter is required`);
+  }
+  if (ingest?.status === "assembly_selection_required") {
+    throw new Error(`${context}: archive root assembly must be selected`);
+  }
+  throw new Error(`${context}: CAD source is not ready (${String(ingest?.status || "unknown")})`);
+}
+
 export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams> {
   async run(event: WorkflowEvent<PipelineParams>, step: WorkflowStep) {
     const { projectId, targetStage, selectedPartIds, instruction, assemblyCandidate } = event.payload;
@@ -40,73 +95,86 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
       const p = await step.do("load-project", () => project(this.env, projectId));
       if (!p.source_key || !p.source_name) throw new Error("Project has no uploaded source");
 
-      // The CAD container filesystem is ephemeral, so every workflow invocation reloads
-      // the source into the same project-scoped container before geometry work.
-      await step.do("mark-ingesting", () => patchStatus(this.env, projectId, "ingesting", Math.min(p.current_stage, 1)));
+      const resolvedAssemblyCandidate = assemblyCandidate ?? p.assembly_candidate ?? undefined;
 
-      const ingest = await step.do("cad-ingest", async () => {
-        const source = await this.env.BUCKET.get(p.source_key!);
-        if (!source?.body) throw new Error("Source object missing from R2");
-        const container = getContainer(this.env.CAD_CONTAINER, projectId);
-        const fixed = new FixedLengthStream(source.size);
-        const piping = source.body.pipeTo(fixed.writable);
-        const request = new Request(`http://cad/v1/jobs/${projectId}/ingest`, {
-          method: "POST",
-          headers: {
-            "x-filename": p.source_name!,
-            ...(assemblyCandidate ? { "x-assembly-candidate": assemblyCandidate } : {})
-          },
-          body: fixed.readable
-        });
-        const [response] = await Promise.all([
-          container.fetch(request),
-          piping.then(() => null)
-        ]);
-        const text = await response.text();
-        if (!response.ok) throw new Error(`CAD ingest ${response.status}: ${text}`);
-        return JSON.parse(text);
-      });
-
-      if (ingest.status === "assembly_selection_required" || ingest.status === "converter_required") {
-        const key = `projects/${projectId}/assembly-candidates.json`;
-        await step.do("save-candidates", () => this.env.BUCKET.put(key, JSON.stringify(ingest), {
-          httpMetadata: { contentType: "application/json" }
-        }));
-        const projectStatus = ingest.status === "converter_required"
-          ? "converter_required"
-          : "assembly_selection_required";
-        await step.do("wait-selection-or-converter", () => patchStatus(this.env, projectId, projectStatus, 0));
-        return { status: ingest.status, candidatesKey: key };
-      }
+      await step.do(
+        "mark-ingesting",
+        () => patchStatus(this.env, projectId, "ingesting", Math.min(p.current_stage, 1))
+      );
 
       const manifestKey = `projects/${projectId}/stage1/manifest.json`;
       const glbKey = `projects/${projectId}/stage1/assembly.glb`;
 
-      await step.do("save-stage1-artifacts", async () => {
-        const container = getContainer(this.env.CAD_CONTAINER, projectId);
+      // Container filesystem is scratch only. Stage 1 loads CAD, extracts artifacts and
+      // persists them to R2 inside one Workflow step so a container restart cannot lose state.
+      const stage1 = await step.do("stage1-cad-persist-v2", async () => {
+        const { container, ingest } = await loadCadSource(
+          this.env,
+          p,
+          projectId,
+          resolvedAssemblyCandidate
+        );
+
+        if (ingest.status === "assembly_selection_required" || ingest.status === "converter_required") {
+          const candidatesKey = `projects/${projectId}/assembly-candidates.json`;
+          await this.env.BUCKET.put(candidatesKey, JSON.stringify(ingest), {
+            httpMetadata: { contentType: "application/json" }
+          });
+          return {
+            status: ingest.status as string,
+            candidatesKey,
+            summary: ingest.summary ?? null
+          };
+        }
+
+        assertCadReady(ingest, "Stage 1");
+
         const [manifestResponse, glbResponse] = await Promise.all([
           container.fetch(`http://cad/v1/jobs/${projectId}/manifest`),
           container.fetch(`http://cad/v1/jobs/${projectId}/artifacts/assembly.glb`)
         ]);
         if (!manifestResponse.ok || !manifestResponse.body) {
-          throw new Error(`Manifest fetch failed: ${manifestResponse.status}`);
+          throw new Error(`Manifest fetch failed in Stage 1 step: ${manifestResponse.status}`);
         }
         if (!glbResponse.ok || !glbResponse.body) {
-          throw new Error(`GLB fetch failed: ${glbResponse.status}`);
+          throw new Error(`GLB fetch failed in Stage 1 step: ${glbResponse.status}`);
         }
+
         await Promise.all([
-          this.env.BUCKET.put(manifestKey, manifestResponse.body, { httpMetadata: { contentType: "application/json" } }),
-          this.env.BUCKET.put(glbKey, glbResponse.body, { httpMetadata: { contentType: "model/gltf-binary" } })
+          this.env.BUCKET.put(manifestKey, manifestResponse.body, {
+            httpMetadata: { contentType: "application/json" }
+          }),
+          this.env.BUCKET.put(glbKey, glbResponse.body, {
+            httpMetadata: { contentType: "model/gltf-binary" }
+          })
         ]);
+
+        return { status: "ready", summary: ingest.summary ?? null };
       });
+
+      if (stage1.status === "assembly_selection_required" || stage1.status === "converter_required") {
+        const projectStatus = stage1.status === "converter_required"
+          ? "converter_required"
+          : "assembly_selection_required";
+        await step.do(
+          "wait-selection-or-converter",
+          () => patchStatus(this.env, projectId, projectStatus, 0)
+        );
+        return {
+          status: stage1.status,
+          candidatesKey: (stage1 as any).candidatesKey
+        };
+      }
 
       await step.do("commit-stage1", async () => {
         await this.env.DB.prepare(
-          "UPDATE projects SET status='stage1_ready', current_stage=MAX(current_stage,1), manifest_key=?, glb_key=?, updated_at=datetime('now') WHERE id=?"
+          "UPDATE projects SET status='stage1_ready', current_stage=MAX(current_stage,1), manifest_key=?, glb_key=?, last_error=NULL, updated_at=datetime('now') WHERE id=?"
         ).bind(manifestKey, glbKey, projectId).run();
       });
 
-      if (targetStage === 1) return { status: "stage1_ready", manifestKey, glbKey };
+      if (targetStage === 1) {
+        return { status: "stage1_ready", manifestKey, glbKey };
+      }
 
       const selection = await step.do("prepare-part-selection", async () => {
         const manifestObject = await this.env.BUCKET.get(manifestKey);
@@ -120,11 +188,8 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         return { parts, chosen };
       });
 
-      // Stage 3 started from an existing Stage 2 draft must NOT regenerate or shrink the
-      // drawing index. The selectedPartIds in that case are only the parts to cost.
       const reuseExistingStage2 =
         targetStage === 3 &&
-        p.current_stage >= 2 &&
         Boolean(p.drawing_index_key);
 
       let revision = event.payload.revision !== undefined
@@ -142,13 +207,15 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
           return JSON.parse(await obj.text());
         });
       } else {
-        await step.do("mark-stage2-generating", () => patchStatus(this.env, projectId, "stage2_generating", 1));
+        await step.do(
+          "mark-stage2-generating",
+          () => patchStatus(this.env, projectId, "stage2_generating", 1)
+        );
 
         const plan = await step.do("stage2-ai-plan", async () => {
           return minimaxJson<any>(this.env, {
             system: [
               "You are a manufacturing drawing planner. Return JSON only.",
-              "Never invent numeric geometry. CAD-kernel values are ground truth.",
               "For each supplied part return exactly one object in parts[].",
               "Schema: {parts:[{part_id,classification,drawing:{primary_view,show_hidden_lines,show_overall_dimensions,show_feature_table,notes,unresolved_requests}}]}.",
               "primary_view must be one of +X,-X,+Y,-Y,+Z,-Z.",
@@ -166,29 +233,43 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         });
 
         planKey = `projects/${projectId}/stage2/r${revision}/drawing-plan.json`;
-        await step.do("save-stage2-plan", () => this.env.BUCKET.put(planKey, JSON.stringify(plan), {
-          httpMetadata: { contentType: "application/json" }
-        }));
-
-        const drawingIndex = await step.do("generate-stage2-drawings", async () => {
-          const container = getContainer(this.env.CAD_CONTAINER, projectId);
-          const response = await container.fetch(new Request(`http://cad/v1/jobs/${projectId}/draw`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              part_ids: selection.chosen.map((part: any) => part.id),
-              revision,
-              drawing_plan: plan
-            })
-          }));
-          const body = await response.text();
-          if (!response.ok) throw new Error(`Drawing generation ${response.status}: ${body}`);
-          return JSON.parse(body);
-        });
+        await step.do("save-stage2-plan", () => this.env.BUCKET.put(
+          planKey,
+          JSON.stringify(plan),
+          { httpMetadata: { contentType: "application/json" } }
+        ));
 
         drawingIndexKey = `projects/${projectId}/stage2/r${revision}/drawing-index.json`;
-        persistedIndex = await step.do("persist-stage2-artifacts", async () => {
-          const container = getContainer(this.env.CAD_CONTAINER, projectId);
+
+        // Reload source, render drawings, copy every artifact to R2 and write the merged
+        // index in one step. No later step depends on Container /tmp.
+        persistedIndex = await step.do("stage2-cad-persist-v2", async () => {
+          const { container, ingest } = await loadCadSource(
+            this.env,
+            p,
+            projectId,
+            resolvedAssemblyCandidate
+          );
+          assertCadReady(ingest, "Stage 2 reload");
+
+          const response = await container.fetch(new Request(
+            `http://cad/v1/jobs/${projectId}/draw`,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                part_ids: selection.chosen.map((part: any) => part.id),
+                revision,
+                drawing_plan: plan
+              })
+            }
+          ));
+          const body = await response.text();
+          if (!response.ok) {
+            throw new Error(`Drawing generation ${response.status}: ${body}`);
+          }
+          const drawingIndex = JSON.parse(body);
+
           const inherited: any[] = [];
           if (revision > 0 && p.drawing_index_key) {
             const previous = await this.env.BUCKET.get(p.drawing_index_key);
@@ -197,22 +278,33 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
               inherited.push(...(previousIndex.drawings ?? []));
             }
           }
-          const byPart = new Map<string, any>(inherited.map((item: any) => [item.part_id, item]));
+          const byPart = new Map<string, any>(
+            inherited.map((item: any) => [item.part_id, item])
+          );
 
           for (const drawing of drawingIndex.drawings ?? []) {
             const savedArtifacts: Record<string, string> = {};
-            await Promise.all(Object.entries(drawing.artifacts ?? {}).map(async ([format, relative]) => {
-              const response = await container.fetch(artifactUrl(projectId, String(relative)));
-              if (!response.ok || !response.body) {
-                throw new Error(`Drawing artifact fetch failed: ${relative} (${response.status})`);
-              }
-              const key = `projects/${projectId}/stage2/${drawing.part_id}/r${revision}/drawing.${format}`;
-              await this.env.BUCKET.put(key, response.body, {
-                httpMetadata: { contentType: contentType(format) }
-              });
-              savedArtifacts[format] = key;
-            }));
-            byPart.set(drawing.part_id, { ...drawing, revision, artifacts: savedArtifacts });
+            await Promise.all(
+              Object.entries(drawing.artifacts ?? {}).map(async ([format, relative]) => {
+                const artifact = await container.fetch(artifactUrl(projectId, String(relative)));
+                if (!artifact.ok || !artifact.body) {
+                  throw new Error(
+                    `Drawing artifact fetch failed: ${relative} (${artifact.status})`
+                  );
+                }
+                const key =
+                  `projects/${projectId}/stage2/${drawing.part_id}/r${revision}/drawing.${format}`;
+                await this.env.BUCKET.put(key, artifact.body, {
+                  httpMetadata: { contentType: contentType(format) }
+                });
+                savedArtifacts[format] = key;
+              })
+            );
+            byPart.set(drawing.part_id, {
+              ...drawing,
+              revision,
+              artifacts: savedArtifacts
+            });
           }
 
           const normalized = {
@@ -229,7 +321,7 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
 
         await step.do("commit-stage2", async () => {
           await this.env.DB.prepare(
-            "UPDATE projects SET status='stage2_draft_ready', current_stage=2, current_revision=?, drawing_plan_key=?, drawing_index_key=?, updated_at=datetime('now') WHERE id=?"
+            "UPDATE projects SET status='stage2_draft_ready', current_stage=2, current_revision=?, drawing_plan_key=?, drawing_index_key=?, last_error=NULL, updated_at=datetime('now') WHERE id=?"
           ).bind(revision, planKey, drawingIndexKey, projectId).run();
         });
       }
@@ -238,11 +330,19 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         return {
           status: "stage2_draft_ready",
           stage1: { manifestKey, glbKey },
-          stage2: { revision, planKey, drawingIndexKey, count: persistedIndex?.count ?? 0 }
+          stage2: {
+            revision,
+            planKey,
+            drawingIndexKey,
+            count: persistedIndex?.count ?? 0
+          }
         };
       }
 
-      await step.do("mark-stage3-generating", () => patchStatus(this.env, projectId, "stage3_generating", 2));
+      await step.do(
+        "mark-stage3-generating",
+        () => patchStatus(this.env, projectId, "stage3_generating", 2)
+      );
 
       const costPolicy = await step.do("stage3-ai-policy", async () => {
         return minimaxJson<any>(this.env, {
@@ -257,63 +357,103 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         });
       });
 
-      const costResult = await step.do("stage3-costing", async () => {
-        const container = getContainer(this.env.CAD_CONTAINER, projectId);
-        const response = await container.fetch(new Request(`http://cad/v1/jobs/${projectId}/cost`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            part_ids: selection.chosen.map((part: any) => part.id),
-            revision,
-            policy: costPolicy
-          })
-        }));
-        const body = await response.text();
-        if (!response.ok) throw new Error(`Costing generation ${response.status}: ${body}`);
-        return JSON.parse(body);
-      });
+      // Same rule for Stage 3: source reload, costing and all artifact persistence are
+      // atomic with respect to Container scratch state.
+      const stage3 = await step.do("stage3-cad-persist-v2", async () => {
+        const { container, ingest } = await loadCadSource(
+          this.env,
+          p,
+          projectId,
+          resolvedAssemblyCandidate
+        );
+        assertCadReady(ingest, "Stage 3 reload");
 
-      const stage3Keys: Record<string, string> = {};
-      await step.do("persist-stage3-artifacts", async () => {
-        const container = getContainer(this.env.CAD_CONTAINER, projectId);
-        await Promise.all(Object.entries(costResult.artifacts ?? {}).map(async ([format, relative]) => {
-          const response = await container.fetch(artifactUrl(projectId, String(relative)));
-          if (!response.ok || !response.body) {
-            throw new Error(`Stage 3 artifact fetch failed: ${relative} (${response.status})`);
+        const response = await container.fetch(new Request(
+          `http://cad/v1/jobs/${projectId}/cost`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              part_ids: selection.chosen.map((part: any) => part.id),
+              revision,
+              policy: costPolicy
+            })
           }
-          const filename = format === "json" ? "costing.json"
-            : format === "xlsx" ? "bom.xlsx"
-            : format === "csv" ? "bom.csv"
-            : "quotation.pdf";
-          const key = `projects/${projectId}/stage3/r${revision}/${filename}`;
-          await this.env.BUCKET.put(key, response.body, {
-            httpMetadata: { contentType: contentType(format) }
-          });
-          stage3Keys[format] = key;
-        }));
+        ));
+        const body = await response.text();
+        if (!response.ok) {
+          throw new Error(`Costing generation ${response.status}: ${body}`);
+        }
+        const costResult = JSON.parse(body);
+
+        const artifactKeys: Record<string, string> = {};
+        await Promise.all(
+          Object.entries(costResult.artifacts ?? {}).map(async ([format, relative]) => {
+            const artifact = await container.fetch(artifactUrl(projectId, String(relative)));
+            if (!artifact.ok || !artifact.body) {
+              throw new Error(
+                `Stage 3 artifact fetch failed: ${relative} (${artifact.status})`
+              );
+            }
+            const filename = format === "json" ? "costing.json"
+              : format === "xlsx" ? "bom.xlsx"
+              : format === "csv" ? "bom.csv"
+              : "quotation.pdf";
+            const key = `projects/${projectId}/stage3/r${revision}/${filename}`;
+            await this.env.BUCKET.put(key, artifact.body, {
+              httpMetadata: { contentType: contentType(format) }
+            });
+            artifactKeys[format] = key;
+          })
+        );
+
+        return {
+          costResult: {
+            quote_complete: Boolean(costResult.quote_complete),
+            currency: costResult.currency,
+            summary: costResult.summary
+          },
+          artifactKeys
+        };
       });
 
       await step.do("commit-stage3", async () => {
         await this.env.DB.prepare(
-          "UPDATE projects SET status='stage3_ready', current_stage=3, costing_key=?, bom_key=?, quotation_key=?, updated_at=datetime('now') WHERE id=?"
-        ).bind(stage3Keys.json ?? null, stage3Keys.xlsx ?? null, stage3Keys.pdf ?? null, projectId).run();
+          "UPDATE projects SET status='stage3_ready', current_stage=3, costing_key=?, bom_key=?, quotation_key=?, last_error=NULL, updated_at=datetime('now') WHERE id=?"
+        ).bind(
+          stage3.artifactKeys.json ?? null,
+          stage3.artifactKeys.xlsx ?? null,
+          stage3.artifactKeys.pdf ?? null,
+          projectId
+        ).run();
       });
 
       return {
         status: "stage3_ready",
         stage1: { manifestKey, glbKey },
-        stage2: { revision, planKey, drawingIndexKey, count: persistedIndex?.count ?? 0 },
+        stage2: {
+          revision,
+          planKey,
+          drawingIndexKey,
+          count: persistedIndex?.count ?? 0
+        },
         stage3: {
-          quoteComplete: Boolean(costResult.quote_complete),
-          currency: costResult.currency,
-          summary: costResult.summary,
-          artifacts: stage3Keys
+          quoteComplete: stage3.costResult.quote_complete,
+          currency: stage3.costResult.currency,
+          summary: stage3.costResult.summary,
+          artifacts: stage3.artifactKeys
         }
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const existing = await project(this.env, event.payload.projectId).catch(() => null);
-      await patchStatus(this.env, event.payload.projectId, "failed", existing?.current_stage ?? 0, message);
+      await patchStatus(
+        this.env,
+        event.payload.projectId,
+        "failed",
+        existing?.current_stage ?? 0,
+        message
+      );
       throw error;
     }
   }
