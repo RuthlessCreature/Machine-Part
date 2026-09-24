@@ -1,4 +1,4 @@
-import type { Manifest, Project } from "../types";
+import type { DrawingIndex, Manifest, Project } from "../types";
 
 async function expect<T>(response: Response): Promise<T> {
   if (!response.ok) throw new Error(await response.text());
@@ -29,6 +29,14 @@ export async function runPipeline(projectId: string, targetStage: 1 | 2 | 3, sel
   }));
 }
 
+export async function reviseDrawing(projectId: string, partId: string, feedback: string) {
+  return expect<{ workflowId: string; revision: number }>(await fetch(`/api/projects/${projectId}/revise`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ partId, feedback })
+  }));
+}
+
 export async function getProject(projectId: string): Promise<Project> {
   return expect(await fetch(`/api/projects/${projectId}`));
 }
@@ -37,6 +45,14 @@ export async function getManifest(projectId: string): Promise<Manifest> {
   return expect(await fetch(`/api/projects/${projectId}/manifest`));
 }
 
+export async function getDrawings(projectId: string): Promise<DrawingIndex> {
+  return expect(await fetch(`/api/projects/${projectId}/drawings`));
+}
+
 export function glbUrl(projectId: string) {
   return `/api/projects/${projectId}/assembly.glb`;
+}
+
+export function drawingUrl(projectId: string, partId: string, format: "json" | "svg" | "pdf" | "dxf") {
+  return `/api/projects/${projectId}/drawings/${partId}/${format}`;
 }
