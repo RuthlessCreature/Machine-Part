@@ -1,5 +1,5 @@
 ikun.homes
 stage1-stage2-stage3
 2026-09-24
-attempt=stable-deploy
-production_release=5231706
+attempt=final-stable-after-headresult-fix
+production_release=a4f80e7
