@@ -6,7 +6,10 @@ export type ProjectStatus =
   | "ingesting"
   | "assembly_selection_required"
   | "stage1_ready"
-  | "stage2_planned"
+  | "stage2_generating"
+  | "stage2_draft_ready"
+  | "stage3_generating"
+  | "stage3_ready"
   | "failed";
 
 export interface PipelineParams {
@@ -14,6 +17,7 @@ export interface PipelineParams {
   targetStage: 1 | 2 | 3;
   selectedPartIds?: string[];
   instruction?: string;
+  revision?: number;
 }
 
 export interface Env {
@@ -32,10 +36,16 @@ export interface ProjectRow {
   name: string;
   status: ProjectStatus;
   current_stage: number;
+  current_revision: number;
   source_key: string | null;
   source_name: string | null;
   manifest_key: string | null;
   glb_key: string | null;
+  drawing_plan_key: string | null;
+  drawing_index_key: string | null;
+  costing_key: string | null;
+  bom_key: string | null;
+  quotation_key: string | null;
   last_error: string | null;
   created_at: string;
   updated_at: string;
