@@ -1,0 +1,12 @@
+{
+  "name": "machine-part",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/web", "apps/worker"],
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "build:web": "npm --workspace apps/web run build",
+    "deploy": "npm run build:web && npm --workspace apps/worker run deploy",
+    "cf:typegen": "npm --workspace apps/worker run cf:typegen"
+  }
+}
