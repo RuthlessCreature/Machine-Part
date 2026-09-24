@@ -1,0 +1,42 @@
+import type { CadContainer } from "./index";
+
+export type ProjectStatus =
+  | "created"
+  | "uploaded"
+  | "ingesting"
+  | "assembly_selection_required"
+  | "stage1_ready"
+  | "stage2_planned"
+  | "failed";
+
+export interface PipelineParams {
+  projectId: string;
+  targetStage: 1 | 2 | 3;
+  selectedPartIds?: string[];
+  instruction?: string;
+}
+
+export interface Env {
+  BUCKET: R2Bucket;
+  DB: D1Database;
+  CAD_PIPELINE: Workflow<PipelineParams>;
+  CAD_CONTAINER: DurableObjectNamespace<CadContainer>;
+  ASSETS: Fetcher;
+  MINIMAX_API_KEY: string;
+  MINIMAX_BASE_URL: string;
+  MINIMAX_MODEL: string;
+}
+
+export interface ProjectRow {
+  id: string;
+  name: string;
+  status: ProjectStatus;
+  current_stage: number;
+  source_key: string | null;
+  source_name: string | null;
+  manifest_key: string | null;
+  glb_key: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
