@@ -66,7 +66,10 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         await step.do("save-candidates", () => this.env.BUCKET.put(key, JSON.stringify(ingest), {
           httpMetadata: { contentType: "application/json" }
         }));
-        await step.do("wait-selection", () => patchStatus(this.env, projectId, "assembly_selection_required", 0));
+        const projectStatus = ingest.status === "converter_required"
+          ? "converter_required"
+          : "assembly_selection_required";
+        await step.do("wait-selection-or-converter", () => patchStatus(this.env, projectId, projectStatus, 0));
         return { status: ingest.status, candidatesKey: key };
       }
 
