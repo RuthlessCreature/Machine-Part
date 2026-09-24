@@ -123,7 +123,7 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
 
       let revision = event.payload.revision !== undefined
         ? requestedRevision
-        : (targetStage === 2 && p.current_stage >= 2 ? p.current_revision + 1 : 0);
+        : (targetStage === 2 && p.drawing_index_key ? p.current_revision + 1 : 0);
       let planKey = p.drawing_plan_key ?? "";
       let drawingIndexKey = p.drawing_index_key ?? "";
       let persistedIndex: any = null;
