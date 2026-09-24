@@ -1,4 +1,4 @@
-import type { DrawingIndex, Manifest, Project } from "../types";
+import type { CostingResult, DrawingIndex, Manifest, Project } from "../types";
 
 async function expect<T>(response: Response): Promise<T> {
   if (!response.ok) throw new Error(await response.text());
@@ -56,4 +56,20 @@ export function glbUrl(projectId: string) {
 export function drawingUrl(projectId: string, partId: string, format: "json" | "svg" | "pdf" | "dxf", revision?: number) {
   const query = revision === undefined ? "" : `?revision=${revision}`;
   return `/api/projects/${projectId}/drawings/${partId}/${format}${query}`;
+}
+
+export async function getCosting(projectId: string): Promise<CostingResult> {
+  return expect(await fetch(`/api/projects/${projectId}/costing`));
+}
+
+export function bomXlsxUrl(projectId: string) {
+  return `/api/projects/${projectId}/bom.xlsx`;
+}
+
+export function bomCsvUrl(projectId: string) {
+  return `/api/projects/${projectId}/bom.csv`;
+}
+
+export function quotationPdfUrl(projectId: string) {
+  return `/api/projects/${projectId}/quotation.pdf`;
 }
