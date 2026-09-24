@@ -53,6 +53,7 @@ export function glbUrl(projectId: string) {
   return `/api/projects/${projectId}/assembly.glb`;
 }
 
-export function drawingUrl(projectId: string, partId: string, format: "json" | "svg" | "pdf" | "dxf") {
-  return `/api/projects/${projectId}/drawings/${partId}/${format}`;
+export function drawingUrl(projectId: string, partId: string, format: "json" | "svg" | "pdf" | "dxf", revision?: number) {
+  const query = revision === undefined ? "" : `?revision=${revision}`;
+  return `/api/projects/${projectId}/drawings/${partId}/${format}${query}`;
 }
