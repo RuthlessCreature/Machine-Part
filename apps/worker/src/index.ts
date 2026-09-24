@@ -115,6 +115,31 @@ export default {
       return p ? artifactResponse(env, p.drawing_index_key) : json({ error: "project not found" }, 404);
     }
 
+    id = idFrom(pathname, "/costing");
+    if (id && request.method === "GET") {
+      const p = await getProject(env, id);
+      return p ? artifactResponse(env, p.costing_key) : json({ error: "project not found" }, 404);
+    }
+
+    id = idFrom(pathname, "/bom.xlsx");
+    if (id && request.method === "GET") {
+      const p = await getProject(env, id);
+      return p ? artifactResponse(env, p.bom_key) : json({ error: "project not found" }, 404);
+    }
+
+    id = idFrom(pathname, "/quotation.pdf");
+    if (id && request.method === "GET") {
+      const p = await getProject(env, id);
+      return p ? artifactResponse(env, p.quotation_key) : json({ error: "project not found" }, 404);
+    }
+
+    id = idFrom(pathname, "/bom.csv");
+    if (id && request.method === "GET") {
+      const p = await getProject(env, id);
+      if (!p) return json({ error: "project not found" }, 404);
+      return artifactResponse(env, `projects/${id}/stage3/r${p.current_revision}/bom.csv`);
+    }
+
     const drawingMatch = pathname.match(/^\/api\/projects\/([^/]+)\/drawings\/([^/]+)\/(json|svg|pdf|dxf)$/);
     if (drawingMatch && request.method === "GET") {
       const [, projectId, partId, format] = drawingMatch;
