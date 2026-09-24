@@ -3,3 +3,4 @@ uvicorn[standard]==0.36.0
 cadquery==2.8.0
 reportlab==4.4.9
 svgwrite==1.4.3
+openpyxl==3.1.5
