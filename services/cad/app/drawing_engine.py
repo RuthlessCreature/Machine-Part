@@ -140,8 +140,7 @@ def _cylinders(shape: Any) -> list[dict[str, Any]]:
     return result
 
 
-def extract_drawing_model(source_step: str | Path, project_id: str, part_id: str) -> dict[str, Any]:
-    loaded = load_step(source_step)
+def extract_drawing_model_loaded(loaded: LoadedStep, project_id: str, part_id: str) -> dict[str, Any]:
     label = find_part_label(loaded, project_id, part_id)
     shape = loaded.shape_tool.GetShape_s(label)
     views = {}
@@ -159,6 +158,10 @@ def extract_drawing_model(source_step: str | Path, project_id: str, part_id: str
         "features": _cylinders(shape),
         "release_status": "draft_requires_human_review",
     }
+
+
+def extract_drawing_model(source_step: str | Path, project_id: str, part_id: str) -> dict[str, Any]:
+    return extract_drawing_model_loaded(load_step(source_step), project_id, part_id)
 
 
 def _layout() -> dict[str, Any]:
@@ -256,10 +259,10 @@ def render_dxf(model: dict[str, Any], out_path: str | Path) -> None:
     Path(out_path).write_text("".join(chunks),encoding="ascii")
 
 
-def generate_drawing_bundle(source_step: str | Path, project_id: str, part_id: str, out_dir: str | Path, revision: int = 0) -> dict[str, Any]:
+def generate_drawing_bundle_loaded(loaded: LoadedStep, project_id: str, part_id: str, out_dir: str | Path, revision: int = 0) -> dict[str, Any]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True,exist_ok=True)
-    model = extract_drawing_model(source_step,project_id,part_id)
+    model = extract_drawing_model_loaded(loaded, project_id, part_id)
     model["revision"] = revision
     paths = {
         "json": out_dir/"drawing.json",
@@ -278,3 +281,7 @@ def generate_drawing_bundle(source_step: str | Path, project_id: str, part_id: s
         "features": model["features"],
         "artifacts": {k: str(v) for k,v in paths.items()},
     }
+
+
+def generate_drawing_bundle(source_step: str | Path, project_id: str, part_id: str, out_dir: str | Path, revision: int = 0) -> dict[str, Any]:
+    return generate_drawing_bundle_loaded(load_step(source_step), project_id, part_id, out_dir, revision)
