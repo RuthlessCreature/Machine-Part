@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 
 from .cad_engine import ingest_step, load_step
 from .drawing_engine import generate_drawing_bundle_loaded
+from .costing_engine import generate_cost_bundle
 
 app = FastAPI(title="Machine Part CAD Service", version="0.2.0")
 WORK_ROOT = Path("/tmp/machine-part")
@@ -145,6 +146,39 @@ async def draw(project_id: str, request: Request) -> dict:
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
+
+
+@app.post("/v1/jobs/{project_id}/cost")
+async def cost(project_id: str, request: Request) -> dict:
+    body = await request.json()
+    part_ids = body.get("part_ids") or []
+    policy = body.get("policy") or {}
+    revision = int(body.get("revision") or 0)
+    if not isinstance(part_ids, list) or not part_ids:
+        raise HTTPException(400, "part_ids must be a non-empty array")
+    source = source_path(project_id)
+    if source.suffix.lower() not in SUPPORTED_STEP:
+        raise HTTPException(409, "Selected source must first be converted to STEP/STP")
+
+    result = generate_cost_bundle(
+        source,
+        project_id,
+        [str(x) for x in part_ids],
+        WORK_ROOT / project_id / "artifacts" / "costing" / f"r{revision}",
+        policy=policy,
+        revision=revision,
+    )
+    prefix = f"costing/r{revision}"
+    return {
+        **{k: v for k, v in result.items() if k != "artifacts"},
+        "revision": revision,
+        "artifacts": {
+            "json": f"{prefix}/costing.json",
+            "xlsx": f"{prefix}/bom.xlsx",
+            "csv": f"{prefix}/bom.csv",
+            "pdf": f"{prefix}/quotation.pdf",
+        },
+    }
 
 
 @app.get("/v1/jobs/{project_id}/manifest")
