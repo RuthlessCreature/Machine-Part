@@ -1,4 +1,4 @@
 production
 domain=ikun.homes
 triggered=2026-09-24
-hotfix=fixed-length-r2-to-container
+hotfix=minimax-region-autodetect
