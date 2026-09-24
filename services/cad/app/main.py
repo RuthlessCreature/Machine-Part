@@ -8,8 +8,8 @@ from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from .cad_engine import ingest_step
-from .drawing_engine import generate_drawing_bundle
+from .cad_engine import ingest_step, load_step
+from .drawing_engine import generate_drawing_bundle_loaded
 
 app = FastAPI(title="Machine Part CAD Service", version="0.2.0")
 WORK_ROOT = Path("/tmp/machine-part")
@@ -107,13 +107,14 @@ async def draw(project_id: str, request: Request) -> dict:
     source = source_path(project_id)
     if source.suffix.lower() not in SUPPORTED_STEP:
         raise HTTPException(409, "Selected source must first be converted to STEP/STP")
+    loaded = load_step(source)
 
     index = []
     for part_id in part_ids:
         part_id = str(part_id)
         try:
-            result = generate_drawing_bundle(
-                source,
+            result = generate_drawing_bundle_loaded(
+                loaded,
                 project_id,
                 part_id,
                 WORK_ROOT / project_id / "artifacts" / "drawings" / part_id / f"r{revision}",
