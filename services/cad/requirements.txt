@@ -1,0 +1,3 @@
+fastapi==0.128.2
+uvicorn[standard]==0.36.0
+cadquery==2.8.0
