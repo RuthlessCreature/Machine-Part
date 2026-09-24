@@ -165,6 +165,26 @@ def build_manifest(loaded: LoadedStep, project_id: str) -> dict[str, Any]:
     }
 
 
+def apply_viewer_ids(loaded: LoadedStep, project_id: str) -> None:
+    """Rename leaf occurrence labels to stable IDs for unambiguous GLB picking.
+
+    The manifest is built before this mutation, so human-facing CAD names remain intact there.
+    """
+    shape_tool = loaded.shape_tool
+
+    def visit(label: TDF_Label) -> None:
+        children = _children(shape_tool, label)
+        if not children:
+            viewer_id = _stable_id(project_id, _label_entry(label))
+            TDataStd_Name.Set_s(label, TCollection_ExtendedString(viewer_id))
+            return
+        for child in children:
+            visit(child)
+
+    for i in range(1, loaded.root_labels.Length() + 1):
+        visit(loaded.root_labels.Value(i))
+
+
 def export_glb(loaded: LoadedStep, out_path: str | Path, linear_deflection: float | None = None) -> dict[str, Any]:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,6 +219,7 @@ def ingest_step(source_path: str | Path, output_dir: str | Path, project_id: str
     output_dir.mkdir(parents=True, exist_ok=True)
     loaded = load_step(source_path)
     manifest = build_manifest(loaded, project_id)
+    apply_viewer_ids(loaded, project_id)
     glb = export_glb(loaded, output_dir / "assembly.glb")
     manifest["artifacts"] = {"assembly_glb": glb}
     manifest_path = output_dir / "manifest.json"
