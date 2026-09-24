@@ -22,22 +22,43 @@ Tested locally with OCP 7.9.3.1 / CadQuery 2.8.0.
 - Summed part volume: approximately 746,573,253.7 mm³.
 - GLB export: 333,864 bytes using merged faces per logical part.
 - GLB mesh-node stable-ID mapping: 137/137 leaf parts matched.
-- CAD ingest + manifest + tessellation + GLB export in the test environment: approximately 1.34 s.
+- CAD ingest + manifest + tessellation + GLB export in the test environment: approximately 1.3 s.
 
 Spot checks:
 - `FRAME_POST_0_0`: approximately 45 × 45 × 2034 mm.
 - `FRAME_POST_0_1`: approximately 45 × 45 × 2034 mm.
-- First 137 leaf parts are individually addressable through XCAF component labels.
+
+## Stage 2 kernel result
+
+- Full batch: 137 parts.
+- Generated artifacts: 548 total files — JSON + SVG + PDF + DXF for every part.
+- Batch drawing generation in the local regression environment: approximately 1.97 s after source load.
+- Hidden-line projection generated with OpenCascade HLR.
+- Overall dimensions are calculated from projected CAD geometry.
+- Cylindrical features are extracted from exact B-Rep surfaces.
+- Example cylindrical feature observed in the supplied assembly: diameter approximately 18 mm, axial span approximately 17.5 mm.
+- Reviewer directive regression verifies a `+X` primary-view request actually changes the rendered drawing and JSON model.
+
+## Automated regression suite
+
+CI covers:
+- synthetic STEP ingest and GLB generation;
+- stable GLB part-ID mapping;
+- deterministic drawing bundle generation;
+- reviewer-directive drawing changes;
+- Stage 3 costing with complete and incomplete material policy;
+- ZIP candidate discovery, Zip Slip rejection and direct STEP extraction;
+- React/Vite production build;
+- Cloudflare Worker TypeScript typecheck.
 
 ## Result
 
-PASS for the Stage 1 kernel baseline: STEP parsing, assembly decomposition, exact property extraction and one-mesh-per-part GLB export.
+PASS for the implemented baseline: STEP assembly decomposition, 3D part picking, deterministic draft drawing generation, controlled drawing revisions and auditable preliminary costing.
 
-## Not yet validated
+## Release gates / not yet claimed
 
-- Browser-to-deployed-Cloudflare end-to-end test.
-- Large (>100 MB) multipart upload path.
-- Nested multi-level production assemblies beyond this sample's single root with direct leaf components.
-- ZIP root-assembly selection UX.
-- Native SolidWorks conversion.
-- Stage 2 engineering drawing output.
+- Browser-to-**deployed Cloudflare production** end-to-end test is pending actual Cloudflare credentials/deployment.
+- Native SolidWorks conversion requires an explicit converter adapter.
+- Full production-grade GB drawing compliance still needs the remaining standard modules and customer template validation.
+- Large (>100 MB) upload strategy needs direct/multipart R2 upload before claiming large-CAD production support.
+- CAM-grade cycle-time accuracy is not claimed; Stage 3 currently uses a transparent parametric estimate and requires production calibration.
