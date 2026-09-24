@@ -3,23 +3,55 @@ from __future__ import annotations
 import json
 import shutil
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from .cad_engine import ingest_step, load_step
-from .drawing_engine import generate_drawing_bundle_loaded
 from .costing_engine import generate_cost_bundle
+from .drawing_engine import generate_drawing_bundle_loaded
 
-app = FastAPI(title="Machine Part CAD Service", version="0.2.0")
+app = FastAPI(title="Machine Part CAD Service", version="0.3.0")
 WORK_ROOT = Path("/tmp/machine-part")
 SUPPORTED_STEP = {".step", ".stp"}
 NATIVE_SW = {".sldasm", ".sldprt"}
+SUPPORTED_ARCHIVE = SUPPORTED_STEP | NATIVE_SW
 
 
 def safe_name(name: str) -> str:
     return Path(name).name.replace("..", "_")
+
+
+def _safe_zip_member(name: str) -> bool:
+    p = PurePosixPath(name.replace("\\", "/"))
+    return not p.is_absolute() and ".." not in p.parts and bool(p.name)
+
+
+def _zip_candidates(source: Path) -> list[dict]:
+    try:
+        with zipfile.ZipFile(source) as zf:
+            names = [
+                name for name in zf.namelist()
+                if _safe_zip_member(name) and Path(name).suffix.lower() in SUPPORTED_ARCHIVE
+            ]
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(400, "Invalid ZIP archive") from exc
+
+    def rank(name: str) -> tuple[int, int, str]:
+        ext = Path(name).suffix.lower()
+        assembly_bias = 0 if ext in {".sldasm", ".step", ".stp"} else 1
+        return assembly_bias, name.count("/"), name.lower()
+
+    return [
+        {
+            "path": name,
+            "format": Path(name).suffix.lower().lstrip("."),
+            "direct": Path(name).suffix.lower() in SUPPORTED_STEP,
+            "requires_converter": Path(name).suffix.lower() in NATIVE_SW,
+        }
+        for name in sorted(names, key=rank)
+    ]
 
 
 def source_path(project_id: str) -> Path:
@@ -44,13 +76,59 @@ def artifact_path(project_id: str, relative_path: str) -> Path:
     return path
 
 
+def _process_selected_archive_member(
+    project_id: str,
+    archive: Path,
+    candidate: str,
+) -> dict:
+    if not _safe_zip_member(candidate):
+        raise HTTPException(400, "Unsafe archive member path")
+    candidates = {item["path"]: item for item in _zip_candidates(archive)}
+    if candidate not in candidates:
+        raise HTTPException(404, "Selected assembly candidate is not present in the archive")
+
+    meta = candidates[candidate]
+    if meta["requires_converter"]:
+        return {
+            "status": "converter_required",
+            "candidate": meta,
+            "note": (
+                "Native SolidWorks is proprietary and cannot be losslessly parsed by OpenCascade. "
+                "Configure the CAD converter adapter to convert this root assembly to STEP AP242/AP214."
+            ),
+        }
+
+    job_dir = WORK_ROOT / project_id
+    selected_name = "selected" + Path(candidate).suffix.lower()
+    selected_path = job_dir / selected_name
+    with zipfile.ZipFile(archive) as zf:
+        with zf.open(candidate) as src, selected_path.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+    (job_dir / "source.json").write_text(
+        json.dumps({"filename": selected_name, "archive_member": candidate}),
+        encoding="utf-8",
+    )
+    manifest = ingest_step(selected_path, job_dir / "artifacts", project_id)
+    return {
+        "status": "ready",
+        "selected_candidate": meta,
+        "summary": {"counts": manifest["counts"], "root_ids": manifest["root_ids"]},
+        "artifacts": ["manifest.json", "assembly.glb"],
+    }
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "service": "cad", "version": "0.2.0"}
+    return {"ok": True, "service": "cad", "version": "0.3.0"}
 
 
 @app.post("/v1/jobs/{project_id}/ingest")
-async def ingest(project_id: str, request: Request, x_filename: str = Header(default="source.step")) -> dict:
+async def ingest(
+    project_id: str,
+    request: Request,
+    x_filename: str = Header(default="source.step"),
+    x_assembly_candidate: str | None = Header(default=None),
+) -> dict:
     job_dir = WORK_ROOT / project_id
     if job_dir.exists():
         shutil.rmtree(job_dir)
@@ -72,25 +150,28 @@ async def ingest(project_id: str, request: Request, x_filename: str = Header(def
         }
 
     if ext == ".zip":
-        try:
-            with zipfile.ZipFile(source) as zf:
-                candidates = [
-                    n for n in zf.namelist()
-                    if Path(n).suffix.lower() in SUPPORTED_STEP | NATIVE_SW
-                ]
-        except zipfile.BadZipFile as exc:
-            raise HTTPException(400, "Invalid ZIP archive") from exc
+        if x_assembly_candidate:
+            return _process_selected_archive_member(project_id, source, x_assembly_candidate)
+        candidates = _zip_candidates(source)
+        if not candidates:
+            raise HTTPException(415, "ZIP contains no supported CAD assembly candidates")
         return {
             "status": "assembly_selection_required",
             "candidates": candidates,
-            "note": "V1 directly processes STEP/STP in ZIP. Native SolidWorks requires a converter adapter.",
+            "note": (
+                "Select the root assembly/file. STEP/STP candidates run directly. "
+                "Native SolidWorks candidates require a converter adapter."
+            ),
         }
 
     if ext in NATIVE_SW:
         return {
             "status": "converter_required",
             "format": ext,
-            "note": "Native SolidWorks is proprietary. Configure a CAD converter adapter instead of faking geometry parsing.",
+            "note": (
+                "Native SolidWorks is proprietary. Configure a CAD converter adapter "
+                "instead of fabricating geometry from an unsupported file."
+            ),
         }
     raise HTTPException(415, f"Unsupported CAD format: {ext or 'unknown'}")
 
@@ -143,7 +224,7 @@ async def draw(project_id: str, request: Request) -> dict:
         })
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "project_id": project_id,
         "revision": revision,
         "count": len(index),
@@ -204,5 +285,7 @@ def get_artifact(project_id: str, relative_path: str) -> FileResponse:
         ".svg": "image/svg+xml",
         ".pdf": "application/pdf",
         ".dxf": "application/dxf",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".csv": "text/csv; charset=utf-8",
     }.get(suffix, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=path.name)
