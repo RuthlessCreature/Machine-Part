@@ -131,6 +131,9 @@ export default {
       const candidates = Array.isArray(candidatesPayload?.candidates) ? candidatesPayload.candidates : [];
       const selected = candidates.find((item: any) => item?.path === candidate);
       if (!selected) return json({ error: "candidate is not in the discovered assembly list" }, 400);
+      await env.DB.prepare(
+        "UPDATE projects SET assembly_candidate=?, last_error=NULL, updated_at=datetime('now') WHERE id=?"
+      ).bind(candidate, id).run();
       if (selected.requires_converter) {
         await env.DB.prepare(
           "UPDATE projects SET status='converter_required', last_error=?, updated_at=datetime('now') WHERE id=?"
