@@ -6,6 +6,7 @@ Web-based CAD decomposition, engineering-drawing, costing and quotation pipeline
 
 ### Stage 1 — implemented and regression-tested
 
+- Selecting a STEP/STP file immediately creates the project, uploads the source and starts Stage 1 in the background; the 3D GLB appears automatically as soon as it is ready.
 - Upload STEP/STP directly.
 - Upload ZIP and select the root CAD candidate in the web UI.
 - ZIP-contained STEP/STP can continue directly.
