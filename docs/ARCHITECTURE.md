@@ -49,7 +49,7 @@ Manifest fields:
 - center of mass;
 - artifact metadata.
 
-GLB is emitted by OCCT `RWGltf_CafWriter` after B-Rep triangulation. Faces are merged per part so the web viewer can highlight a logical part rather than hundreds of individual faces.
+GLB is emitted by OCCT `RWGltf_CafWriter` after B-Rep triangulation. Faces are merged per part and leaf occurrence node names are rewritten to project-scoped stable part IDs, so duplicate CAD display names cannot cause ambiguous picking/highlighting.
 
 ## MiniMax M3 policy
 
