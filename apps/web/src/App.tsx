@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { AssemblyViewer } from "./components/AssemblyViewer";
 import {
   bomCsvUrl,
@@ -45,6 +45,9 @@ export default function App() {
   const [message, setMessage] = useState("等待上传 CAD 文件");
   const [instruction, setInstruction] = useState("");
   const [targetStage, setTargetStage] = useState<1 | 2 | 3>(1);
+  const loadSeqRef = useRef(0);
+  const targetStageRef = useRef<1 | 2 | 3>(1);
+  const instructionRef = useRef("");
 
   const parts = useMemo(() => manifest?.nodes.filter(n => n.kind === "part") ?? [], [manifest]);
   const activeDrawing = useMemo(
@@ -100,6 +103,126 @@ export default function App() {
     throw new Error("前端等待超时；请检查 Workflow / Container 日志");
   }
 
+  async function pollAutoStage1(id: string, seq: number): Promise<Project | null> {
+    for (let i = 0; i < 300; i++) {
+      if (seq !== loadSeqRef.current) return null;
+      const p = await getProject(id);
+      if (seq !== loadSeqRef.current) return null;
+      setProject(p);
+      setMessage(`后台解析：${p.status}`);
+
+      if (p.status === "failed") throw new Error(p.last_error || "流水线失败");
+
+      if (p.status === "assembly_selection_required" || p.status === "converter_required") {
+        const candidates = await getAssemblyCandidates(id);
+        if (seq !== loadSeqRef.current) return null;
+        setAssemblyChoice(candidates);
+        setMessage(
+          p.status === "converter_required"
+            ? "当前 CAD 格式需要 SolidWorks 转换适配器"
+            : "ZIP 已解析：请选择根装配体后继续"
+        );
+        return p;
+      }
+
+      if (p.current_stage >= 1) {
+        await loadArtifacts(id, p);
+        if (seq !== loadSeqRef.current) return null;
+        setViewMode("3d");
+        setMessage("3D 装配体已就绪；可继续操作，后续阶段可后台运行");
+        return p;
+      }
+      await sleep(900);
+    }
+    throw new Error("后台 3D 解析等待超时；请检查 Workflow / Container 日志");
+  }
+
+  async function continueAfterStage1(id: string, seq: number) {
+    const desired = targetStageRef.current;
+    if (desired <= 1 || seq !== loadSeqRef.current) return;
+    setMessage(`3D 已显示；后台继续运行到阶段 ${desired}…`);
+    await runPipeline(id, desired, [], instructionRef.current);
+    const reached = await poll(id, desired);
+    if (seq !== loadSeqRef.current) return;
+    applyReachedStage(reached, desired);
+  }
+
+  async function beginUploadAndRender(nextFile: File) {
+    const seq = ++loadSeqRef.current;
+    setFile(nextFile);
+    setBusy(true);
+    setProject(null);
+    setManifest(null);
+    setDrawings(null);
+    setCosting(null);
+    setAssemblyChoice(null);
+    setSelected(new Set());
+    setCostSelected(new Set());
+    setViewMode("3d");
+
+    try {
+      setMessage("创建项目并上传 CAD…");
+      const p = await createProject(nextFile.name.replace(/\.[^.]+$/, ""));
+      if (seq !== loadSeqRef.current) return;
+      setProject(p);
+
+      setMessage("上传到 R2…");
+      await uploadSource(p.id, nextFile);
+      if (seq !== loadSeqRef.current) return;
+
+      setMessage("上传完成，后台开始解析 / 3D 渲染…");
+      await runPipeline(p.id, 1, [], "");
+      const reached = await pollAutoStage1(p.id, seq);
+      if (!reached || seq !== loadSeqRef.current) return;
+
+      if (reached.current_stage >= 1) {
+        await continueAfterStage1(p.id, seq);
+      }
+    } catch (e) {
+      if (seq !== loadSeqRef.current) return;
+      setMessage(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (seq === loadSeqRef.current) setBusy(false);
+    }
+  }
+
+  function onFileSelected(nextFile: File | null) {
+    if (!nextFile) {
+      setFile(null);
+      return;
+    }
+    void beginUploadAndRender(nextFile);
+  }
+
+  async function continueToSelectedStage() {
+    if (!file) return;
+    if (!project || project.current_stage < 1) {
+      await beginUploadAndRender(file);
+      return;
+    }
+    if (targetStage <= project.current_stage) {
+      setViewMode(targetStage >= 3 ? "costing" : targetStage >= 2 ? "drawing" : "3d");
+      setMessage(`阶段 ${targetStage} 已完成`);
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const selectedIds =
+        targetStage === 2 && selected.size ? Array.from(selected)
+        : targetStage === 3 && costSelected.size ? Array.from(costSelected)
+        : [];
+      setMessage(`继续运行到阶段 ${targetStage}…`);
+      await runPipeline(project.id, targetStage, selectedIds, instructionRef.current);
+      const reached = await poll(project.id, targetStage);
+      applyReachedStage(reached, targetStage);
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function applyReachedStage(p: Project, target: 1 | 2 | 3) {
     if (p.status === "assembly_selection_required" || p.status === "converter_required") return;
     if (target === 1) {
@@ -114,45 +237,24 @@ export default function App() {
     }
   }
 
-  async function startNew() {
-    if (!file) return;
-    setBusy(true);
-    setDrawings(null);
-    setCosting(null);
-    setManifest(null);
-    setAssemblyChoice(null);
-    setSelected(new Set());
-    setCostSelected(new Set());
-    try {
-      setMessage("创建项目…");
-      const p = await createProject(file.name.replace(/\.[^.]+$/, ""));
-      setProject(p);
-      setMessage("上传到 R2…");
-      await uploadSource(p.id, file);
-      setMessage(`启动流水线到阶段 ${targetStage}…`);
-      await runPipeline(p.id, targetStage, [], instruction);
-      const reached = await poll(p.id, targetStage);
-      applyReachedStage(reached, targetStage);
-    } catch (e) {
-      setMessage(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function chooseAssembly(candidate: AssemblyCandidate) {
     if (!project || candidate.requires_converter) return;
+    const seq = loadSeqRef.current;
     setBusy(true);
     try {
       setMessage(`加载 ZIP 内装配体：${candidate.path}…`);
-      await selectAssembly(project.id, candidate.path, targetStage, instruction);
+      await selectAssembly(project.id, candidate.path, 1, "");
       setAssemblyChoice(null);
-      const reached = await poll(project.id, targetStage);
-      applyReachedStage(reached, targetStage);
+      const reached = await pollAutoStage1(project.id, seq);
+      if (reached?.current_stage && seq === loadSeqRef.current) {
+        await continueAfterStage1(project.id, seq);
+      }
     } catch (e) {
-      setMessage(e instanceof Error ? e.message : String(e));
+      if (seq === loadSeqRef.current) {
+        setMessage(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBusy(false);
+      if (seq === loadSeqRef.current) setBusy(false);
     }
   }
 
@@ -243,15 +345,19 @@ export default function App() {
             <input
               type="file"
               accept=".step,.stp,.zip,.sldasm,.sldprt"
-              onChange={e => setFile(e.target.files?.[0] ?? null)}
+              onChange={e => onFileSelected(e.target.files?.[0] ?? null)}
             />
             <strong>{file ? file.name : "选择 STEP / ZIP / CAD 文件"}</strong>
-            <small>STEP/STP 直接解析；ZIP 可选根装配体；原生 SolidWorks 需要转换适配器，不伪解析。</small>
+            <small>选中 STEP/STP 后立即上传并后台解析；GLB 一生成就自动显示 3D。ZIP 会先列根装配体候选。</small>
           </label>
 
           <div className="field">
             <label>新项目运行目标</label>
-            <select value={targetStage} onChange={e => setTargetStage(Number(e.target.value) as 1|2|3)}>
+            <select value={targetStage} onChange={e => {
+              const next = Number(e.target.value) as 1 | 2 | 3;
+              targetStageRef.current = next;
+              setTargetStage(next);
+            }}>
               <option value={1}>阶段 1 · 解析 / 拆件 / 3D</option>
               <option value={2}>一键到阶段 2 · 全部 Part 出草图</option>
               <option value={3}>一键到底 · 图纸 + 核价 + 报价</option>
@@ -262,13 +368,22 @@ export default function App() {
             <label>一键到底 / 微调提示词</label>
             <textarea
               value={instruction}
-              onChange={e => setInstruction(e.target.value)}
+              onChange={e => {
+                instructionRef.current = e.target.value;
+                setInstruction(e.target.value);
+              }}
               placeholder="例如：材料 6061-T6，材料价 30 CNY/kg；机时 120 CNY/h；毛利率 25%；跳过标准件。"
             />
           </div>
 
-          <button className="primary" disabled={!file || busy} onClick={startNew}>
-            {busy ? "运行中…" : "新建并运行"}
+          <button className="primary" disabled={!file || busy} onClick={continueToSelectedStage}>
+            {busy
+              ? "后台处理中…"
+              : !project
+                ? "重新上传并解析"
+                : targetStage <= project.current_stage
+                  ? `阶段 ${targetStage} 已完成`
+                  : `继续到阶段 ${targetStage}`}
           </button>
 
           {project && project.current_stage >= 1 && (
@@ -370,7 +485,7 @@ export default function App() {
             <div className="empty-view">
               <div className="wirecube"/>
               <h1>装配体视窗</h1>
-              <p>上传真实 CAD 后，OCCT 在 Cloudflare Container 内解析并输出 GLB。</p>
+              <p>{busy ? "文件已上传，后台正在解析几何并生成 GLB；完成后这里会自动出现 3D 装配体。" : "选择 STEP/STP 后立即后台解析并显示 3D 装配体。"}</p>
             </div>
           )}
 
