@@ -1,4 +1,4 @@
-import type { CostingResult, DrawingIndex, Manifest, Project } from "../types";
+import type { AssemblyCandidateResponse, CostingResult, DrawingIndex, Manifest, Project } from "../types";
 
 async function expect<T>(response: Response): Promise<T> {
   if (!response.ok) throw new Error(await response.text());
@@ -72,4 +72,23 @@ export function bomCsvUrl(projectId: string) {
 
 export function quotationPdfUrl(projectId: string) {
   return `/api/projects/${projectId}/quotation.pdf`;
+}
+
+export async function getAssemblyCandidates(projectId: string): Promise<AssemblyCandidateResponse> {
+  return expect(await fetch(`/api/projects/${projectId}/assembly-candidates`));
+}
+
+export async function selectAssembly(
+  projectId: string,
+  candidate: string,
+  targetStage: 1 | 2 | 3,
+  instruction: string
+) {
+  return expect<{ workflowId: string; targetStage: number; candidate: string }>(
+    await fetch(`/api/projects/${projectId}/select-assembly`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ candidate, targetStage, instruction })
+    })
+  );
 }
