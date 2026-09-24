@@ -1,0 +1,133 @@
+name: Production Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".smoke/production"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install STEP fixture generator
+        run: pip install --disable-pip-version-check cadquery==2.8.0
+
+      - name: Run Stage 1 → Stage 2 → Stage 3 against production
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          import cadquery as cq
+          from cadquery import exporters
+
+          BASE = "https://ikun.homes"
+          step_path = Path("/tmp/machine-part-smoke.step")
+          exporters.export(
+              cq.Workplane("XY").box(20, 30, 40).val(),
+              str(step_path),
+              exportType="STEP",
+          )
+
+          def request(method, path, body=None, content_type="application/json"):
+              data = None
+              headers = {}
+              if body is not None:
+                  if isinstance(body, (dict, list)):
+                      data = json.dumps(body).encode()
+                  elif isinstance(body, bytes):
+                      data = body
+                  else:
+                      data = str(body).encode()
+                  headers["content-type"] = content_type
+              req = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      raw = r.read()
+                      ctype = r.headers.get("content-type", "")
+                      if "json" in ctype:
+                          return r.status, json.loads(raw)
+                      return r.status, raw
+              except urllib.error.HTTPError as e:
+                  raw = e.read().decode(errors="replace")
+                  raise RuntimeError(f"{method} {path} -> HTTP {e.code}: {raw}") from e
+
+          status, health = request("GET", "/api/health")
+          assert status == 200 and health.get("ok") is True, health
+
+          _, created = request("POST", "/api/projects", {"name": "production-smoke"})
+          project_id = created["id"]
+          print("project", project_id)
+
+          request(
+              "PUT",
+              f"/api/projects/{project_id}/source?filename=smoke.step",
+              step_path.read_bytes(),
+              "application/step",
+          )
+
+          instruction = (
+              "Material 6061-T6. Material price 30 CNY/kg. "
+              "Machine rate 120 CNY/hour. Gross margin 25%. "
+              "Stock factor 1.30. Removal rate 12 cm3/min. "
+              "Setup 15 min. Inspection 8 min. Tooling 8%. Scrap 5%. "
+              "Keep overall dimensions and cylindrical feature table."
+          )
+          request(
+              "POST",
+              f"/api/projects/{project_id}/run",
+              {"targetStage": 3, "selectedPartIds": [], "instruction": instruction},
+          )
+
+          terminal = None
+          for _ in range(420):
+              _, project = request("GET", f"/api/projects/{project_id}")
+              if project["status"] == "failed":
+                  raise RuntimeError(f"Production pipeline failed: {project.get('last_error')}")
+              if project["current_stage"] >= 3 and project["status"] == "stage3_ready":
+                  terminal = project
+                  break
+              time.sleep(1)
+          if terminal is None:
+              raise RuntimeError("Production pipeline did not reach Stage 3 within 7 minutes")
+
+          _, manifest = request("GET", f"/api/projects/{project_id}/manifest")
+          assert manifest["counts"]["parts"] >= 1, manifest["counts"]
+
+          _, drawings = request("GET", f"/api/projects/{project_id}/drawings")
+          assert drawings["count"] >= 1, drawings
+
+          _, costing = request("GET", f"/api/projects/{project_id}/costing")
+          assert costing["quote_complete"] is True, costing
+          assert costing["totals"]["quoted_price"] > costing["totals"]["estimated_cost"] > 0, costing["totals"]
+
+          for path in (
+              f"/api/projects/{project_id}/bom.xlsx",
+              f"/api/projects/{project_id}/quotation.pdf",
+          ):
+              status, blob = request("GET", path)
+              assert status == 200 and isinstance(blob, bytes) and len(blob) > 100, (path, status, len(blob))
+
+          print(json.dumps({
+              "ok": True,
+              "project_id": project_id,
+              "parts": manifest["counts"]["parts"],
+              "drawings": drawings["count"],
+              "quoted_price": costing["totals"]["quoted_price"],
+              "currency": costing["currency"],
+          }))
+          PY
