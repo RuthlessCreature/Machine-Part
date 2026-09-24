@@ -45,7 +45,10 @@ jobs:
 
           def request(method, path, body=None, content_type="application/json"):
               data = None
-              headers = {}
+              headers = {
+                  "User-Agent": "curl/8.5.0",
+                  "Accept": "*/*",
+              }
               if body is not None:
                   if isinstance(body, (dict, list)):
                       data = json.dumps(body).encode()
