@@ -41,7 +41,7 @@ export default {
     const { pathname } = url;
 
     if (request.method === "GET" && pathname === "/api/health") {
-      return json({ ok: true, service: "machine-part", version: "0.2.0" });
+      return json({ ok: true, service: "machine-part", version: "0.3.0" });
     }
 
     if (request.method === "GET" && pathname === "/api/minimax/quota") {
@@ -91,10 +91,56 @@ export default {
           projectId: id,
           targetStage,
           selectedPartIds: Array.isArray(body.selectedPartIds) ? body.selectedPartIds : undefined,
-          instruction: typeof body.instruction === "string" ? body.instruction : undefined
+          instruction: typeof body.instruction === "string" ? body.instruction : undefined,
+          assemblyCandidate: typeof body.assemblyCandidate === "string" ? body.assemblyCandidate : undefined
         }
       });
       return json({ workflowId: instance.id, targetStage }, 202);
+    }
+
+    id = idFrom(pathname, "/assembly-candidates");
+    if (id && request.method === "GET") {
+      const p = await getProject(env, id);
+      if (!p) return json({ error: "project not found" }, 404);
+      return artifactResponse(env, `projects/${id}/assembly-candidates.json`);
+    }
+
+    id = idFrom(pathname, "/select-assembly");
+    if (id && request.method === "POST") {
+      const p = await getProject(env, id);
+      if (!p) return json({ error: "project not found" }, 404);
+      const body = await request.json<any>().catch(() => ({}));
+      const candidate = typeof body.candidate === "string" ? body.candidate : "";
+      if (!candidate) return json({ error: "candidate is required" }, 400);
+
+      const candidatesObject = await env.BUCKET.get(`projects/${id}/assembly-candidates.json`);
+      if (!candidatesObject) return json({ error: "assembly candidates not found" }, 409);
+      const candidatesPayload: any = JSON.parse(await candidatesObject.text());
+      const candidates = Array.isArray(candidatesPayload?.candidates) ? candidatesPayload.candidates : [];
+      const selected = candidates.find((item: any) => item?.path === candidate);
+      if (!selected) return json({ error: "candidate is not in the discovered assembly list" }, 400);
+      if (selected.requires_converter) {
+        await env.DB.prepare(
+          "UPDATE projects SET status='converter_required', last_error=?, updated_at=datetime('now') WHERE id=?"
+        ).bind("Native SolidWorks requires a configured converter adapter before Stage 1 can continue.", id).run();
+        return json({
+          status: "converter_required",
+          candidate: selected,
+          error: "Native SolidWorks converter adapter is not configured"
+        }, 409);
+      }
+
+      const targetStage = Math.max(1, Math.min(3, Number(body.targetStage || 1))) as 1 | 2 | 3;
+      const instance = await env.CAD_PIPELINE.create({
+        id: `${id}-assembly-${Date.now()}`,
+        params: {
+          projectId: id,
+          targetStage,
+          assemblyCandidate: candidate,
+          instruction: typeof body.instruction === "string" ? body.instruction : undefined
+        }
+      });
+      return json({ workflowId: instance.id, targetStage, candidate }, 202);
     }
 
     id = idFrom(pathname, "/manifest");
