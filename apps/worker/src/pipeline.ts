@@ -263,11 +263,14 @@ export class CadPipelineWorkflow extends WorkflowEntrypoint<Env, PipelineParams>
         });
 
         planKey = `projects/${projectId}/stage2/r${revision}/drawing-plan.json`;
-        await step.do("save-stage2-plan", () => this.env.BUCKET.put(
-          planKey,
-          JSON.stringify(plan),
-          { httpMetadata: { contentType: "application/json" } }
-        ));
+        await step.do("save-stage2-plan", async () => {
+          await this.env.BUCKET.put(
+            planKey,
+            JSON.stringify(plan),
+            { httpMetadata: { contentType: "application/json" } }
+          );
+          return { ok: true, key: planKey };
+        });
 
         drawingIndexKey = `projects/${projectId}/stage2/r${revision}/drawing-index.json`;
 
