@@ -41,7 +41,7 @@ export default {
     const { pathname } = url;
 
     if (request.method === "GET" && pathname === "/api/health") {
-      return json({ ok: true, service: "machine-part", version: "0.1.0" });
+      return json({ ok: true, service: "machine-part", version: "0.2.0" });
     }
 
     if (request.method === "GET" && pathname === "/api/minimax/quota") {
@@ -107,6 +107,52 @@ export default {
     if (id && request.method === "GET") {
       const p = await getProject(env, id);
       return p ? artifactResponse(env, p.glb_key) : json({ error: "project not found" }, 404);
+    }
+
+    id = idFrom(pathname, "/drawings");
+    if (id && request.method === "GET") {
+      const p = await getProject(env, id);
+      return p ? artifactResponse(env, p.drawing_index_key) : json({ error: "project not found" }, 404);
+    }
+
+    const drawingMatch = pathname.match(/^\/api\/projects\/([^/]+)\/drawings\/([^/]+)\/(json|svg|pdf|dxf)$/);
+    if (drawingMatch && request.method === "GET") {
+      const [, projectId, partId, format] = drawingMatch;
+      const p = await getProject(env, projectId);
+      if (!p) return json({ error: "project not found" }, 404);
+      const key = `projects/${projectId}/stage2/${partId}/r${p.current_revision}/drawing.${format}`;
+      return artifactResponse(env, key);
+    }
+
+    id = idFrom(pathname, "/revise");
+    if (id && request.method === "POST") {
+      const p = await getProject(env, id);
+      if (!p) return json({ error: "project not found" }, 404);
+      if (p.current_stage < 2) return json({ error: "Stage 2 draft is not ready" }, 409);
+      const body = await request.json<any>().catch(() => ({}));
+      const partId = typeof body.partId === "string" ? body.partId : "";
+      const feedback = typeof body.feedback === "string" ? body.feedback.trim() : "";
+      if (!partId || !feedback) return json({ error: "partId and feedback are required" }, 400);
+      const revision = p.current_revision + 1;
+      const reviewKey = `projects/${id}/stage2/reviews/r${revision}.json`;
+      await env.BUCKET.put(reviewKey, JSON.stringify({
+        projectId: id,
+        partId,
+        revision,
+        feedback,
+        createdAt: new Date().toISOString()
+      }), { httpMetadata: { contentType: "application/json" } });
+      const instance = await env.CAD_PIPELINE.create({
+        id: `${id}-revision-${revision}-${Date.now()}`,
+        params: {
+          projectId: id,
+          targetStage: 2,
+          selectedPartIds: [partId],
+          instruction: `Reviewer feedback for drawing revision ${revision}: ${feedback}`,
+          revision
+        }
+      });
+      return json({ workflowId: instance.id, revision, reviewKey }, 202);
     }
 
     if (pathname.startsWith("/api/")) return json({ error: "not found" }, 404);
