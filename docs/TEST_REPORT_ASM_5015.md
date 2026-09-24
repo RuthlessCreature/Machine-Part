@@ -21,6 +21,7 @@ Tested locally with OCP 7.9.3.1 / CadQuery 2.8.0.
 - Global bounding box: approximately 1797.5 × 1140.0 × 2102.5 mm.
 - Summed part volume: approximately 746,573,253.7 mm³.
 - GLB export: 333,864 bytes using merged faces per logical part.
+- GLB mesh-node stable-ID mapping: 137/137 leaf parts matched.
 - CAD ingest + manifest + tessellation + GLB export in the test environment: approximately 1.34 s.
 
 Spot checks:
