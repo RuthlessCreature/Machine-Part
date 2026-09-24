@@ -30,8 +30,8 @@
     {
       "class_name": "CadContainer",
       "image": "./services/cad/Dockerfile",
-      "instance_type": "basic",
-      "max_instances": 10
+      "instance_type": "standard-1",
+      "max_instances": 3
     }
   ],
   "durable_objects": {
